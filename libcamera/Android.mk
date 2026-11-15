@@ -26,9 +26,11 @@ LOCAL_SHARED_LIBRARIES := \
     libcutils \
     liblog \
     libdl \
-    libgenlock
+    libgenlock \
+    libbinder
 
 LOCAL_C_INCLUDES += \
-    frameworks/base/include/camera
+    frameworks/base/include/camera \
+    hardware/msm7k/libgralloc-qsd8k
 
 include $(BUILD_SHARED_LIBRARY)

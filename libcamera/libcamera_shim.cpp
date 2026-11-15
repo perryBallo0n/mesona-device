@@ -1,18 +1,29 @@
 /* Qualcomm Camera Compatibility Shim for Android 2.3 Gingerbread */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <poll.h>
+#include <pthread.h>
 #include <utils/Log.h>
 #include <camera/CameraHardwareInterface.h>
+#include <hardware/hardware.h>
+#include <binder/MemoryBase.h>
+#include <binder/MemoryHeapBase.h>
 
 #define LOG_TAG "libcamera_shim"
 
 extern "C" {
 
 /* Genlock buffer stubs */
-int genlock_lock_buffer(void* hnd, int timeout) { return 0; }
+int genlock_lock_buffer(void* hnd, int type, int timeout) { return 0; }
 int genlock_unlock_buffer(void* hnd) { return 0; }
 
 /* CameraParameters method stubs */
@@ -70,7 +81,6 @@ const char _ZN7android16CameraParameters18FACE_DETECTION_OFFE[] = "face-detectio
 const char _ZN7android16CameraParameters18KEY_FACE_DETECTIONE[] = "face-detection";
 const char _ZN7android16CameraParameters18KEY_MAX_SATURATIONE[] = "max-saturation";
 const char _ZN7android16CameraParameters18KEY_METERING_AREASE[] = "metering-areas";
-const char _ZN7android16CameraParameters18KEY_RECORDING_HINTE[] = "recording-hint";
 const char _ZN7android16CameraParameters18SCENE_MODE_FLOWERSE[] = "flowers";
 const char _ZN7android16CameraParameters19KEY_SEMC_METRY_MODEE[] = "semc-metry-mode";
 const char _ZN7android16CameraParameters20KEY_GPS_ALTITUDE_REFE[] = "gps-altitude-ref";
@@ -98,10 +108,6 @@ const char _ZN7android16CameraParameters27AUTO_EXPOSURE_SPOT_METERINGE[] = "spot
 const char _ZN7android16CameraParameters27KEY_SUPPORTED_AUTO_EXPOSUREE[] = "auto-exposure-values";
 const char _ZN7android16CameraParameters28KEY_MEMORY_COLOR_ENHANCEMENTE[] = "mce";
 const char _ZN7android16CameraParameters28PIXEL_FORMAT_YUV420SP_ADRENOE[] = "yuv420sp-adreno";
-const char _ZN7android16CameraParameters28SKIN_TONE_ENHANCEMENT_ENABLEE[] = "enable";
-const char _ZN7android16CameraParameters29AUTO_EXPOSURE_CENTER_WEIGHTEDE[] = "center-weighted";
-const char _ZN7android16CameraParameters29FOCUS_MODE_CONTINUOUS_PICTUREE[] = "continuous-picture";
-const char _ZN7android16CameraParameters29KEY_SUPPORTED_HISTOGRAM_MODESE[] = "histogram-values";
 const char _ZN7android16CameraParameters29KEY_SUPPORTED_LENSSHADE_MODESE[] = "lensshade-values";
 const char _ZN7android16CameraParameters29SKIN_TONE_ENHANCEMENT_DISABLEE[] = "disable";
 const char _ZN7android16CameraParameters30KEY_HIGH_DYNAMIC_RANGE_IMAGINGE[] = "hdr";
@@ -125,22 +131,165 @@ const char _ZN7android16CameraParameters7ZSL_OFFE[] = "off";
 const char _ZN7android16CameraParameters8ISO_1600E[] = "ISO1600";
 const char _ZN7android16CameraParameters8ISO_AUTOE[] = "auto";
 
-/* IOCTL Interceptor for Qualcomm Camera Server */
-static int (*s_real_ioctl)(int, int, ...) = NULL;
-int ioctl(int fd, int request, ...) {
+/* ========================================================================= */
+/* Persistent Disk Logger for Crash Diagnosis                                */
+/* ========================================================================= */
+
+static void disk_log(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    LOGI("%s", buf);
+    FILE* fp = fopen("/data/local/tmp/shim.log", "a");
+    if (fp) {
+        fputs(buf, fp);
+        fputc('\n', fp);
+        fflush(fp);
+        fclose(fp);
+    }
+}
+
+/* ========================================================================= */
+/* Dynamic GOT Hooking and Interception                                      */
+/* ========================================================================= */
+
+static int (*g_orig_ioctl)(int, int, ...) = NULL;
+static int (*g_orig_open)(const char*, int, ...) = NULL;
+static int (*g_orig_select)(int, fd_set*, fd_set*, fd_set*, struct timeval*) = NULL;
+static int g_config_fd = -1;
+static int g_frame_fd = -1;
+static volatile bool g_preview_active = false;
+static volatile bool g_start_preview_in_progress = false;
+static int g_frame_index = 0;
+static uint32_t g_frame_seq = 0;
+
+struct preview_buf_info_t {
+    void* base;
+    int fd;
+    size_t size;
+    size_t offset;
+};
+static const int MAX_SHIM_BUFFERS = 8;
+static preview_buf_info_t g_shim_buffers[MAX_SHIM_BUFFERS];
+static int g_shim_buffer_count = 0;
+static int g_shim_preview_w = 640;
+static int g_shim_preview_h = 480;
+
+struct shim_crop_info {
+    uint32_t in_w;
+    uint32_t out_w;
+    uint32_t in_h;
+    uint32_t out_h;
+};
+static shim_crop_info g_shim_crop = { 640, 640, 480, 480 };
+
+struct gb_msm_frame {
+    struct timespec ts;          /* offset 0..7 (8 bytes) */
+    int path;                    /* offset 8 (4 bytes) */
+    int type;                    /* offset 12 (4 bytes) */
+    unsigned long buffer;        /* offset 16 (4 bytes) */
+    uint32_t phy_offset;         /* offset 20 (4 bytes) */
+    uint32_t y_off;              /* offset 24 (4 bytes) */
+    uint32_t cbcr_off;           /* offset 28 (4 bytes) */
+    uint32_t planar0_off;        /* offset 32 (4 bytes) */
+    uint32_t planar1_off;        /* offset 36 (4 bytes) */
+    uint32_t planar2_off;        /* offset 40 (4 bytes) */
+    int fd;                      /* offset 44 (4 bytes) */
+    void *cropinfo;              /* offset 48 (4 bytes) */
+    int croplen;                 /* offset 52 (4 bytes) */
+    uint32_t error_code;         /* offset 56 (4 bytes) */
+    uint8_t roi_info[16];        /* offset 60..75 (16 bytes) */
+    uint32_t frame_id;           /* offset 76 (4 bytes) */
+    int stcam_quality_ind;       /* offset 80 (4 bytes) */
+    uint32_t stcam_conv_value;   /* offset 84 (4 bytes) */
+    uint8_t pad[16];             /* offset 88..103 (16 bytes) -> total 104 bytes */
+};
+
+static void init_real_libc() {
+    if (!g_orig_ioctl) {
+        void* libc = dlopen("libc.so", RTLD_NOW);
+        if (libc) {
+            g_orig_ioctl = (int (*)(int, int, ...))dlsym(libc, "ioctl");
+            LOGI("init_real_libc: resolved libc ioctl = %p", g_orig_ioctl);
+        }
+    }
+    if (!g_orig_open) {
+        void* libc = dlopen("libc.so", RTLD_NOW);
+        if (libc) {
+            g_orig_open = (int (*)(const char*, int, ...))dlsym(libc, "open");
+            LOGI("init_real_libc: resolved libc open = %p", g_orig_open);
+        }
+    }
+    if (!g_orig_select) {
+        void* libc = dlopen("libc.so", RTLD_NOW);
+        if (libc) {
+            g_orig_select = (int (*)(int, fd_set*, fd_set*, fd_set*, struct timeval*))dlsym(libc, "select");
+            LOGI("init_real_libc: resolved libc select = %p", g_orig_select);
+        }
+    }
+}
+
+static uintptr_t get_lib_base(const char* libname) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) {
+        LOGE("get_lib_base: could not open /proc/self/maps");
+        return 0;
+    }
+    char line[512];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, libname)) {
+            char* endptr = NULL;
+            base = (uintptr_t)strtoul(line, &endptr, 16);
+            break;
+        }
+    }
+    fclose(fp);
+    return base;
+}
+
+static void setup_camera_callbacks();
+
+static void inject_sensor_dimensions() {
+    uintptr_t oem_base = get_lib_base("liboemcamera.so");
+    if (!oem_base) {
+        disk_log("inject_sensor_dimensions: liboemcamera.so base not found");
+        LOGW("inject_sensor_dimensions: liboemcamera.so base not found");
+        return;
+    }
+    uint32_t* cam_ctrl = (uint32_t*)(oem_base + 0x9c7c0);
+    disk_log("inject_sensor_dimensions: BEFORE: snap=%ux%u, prev=%ux%u, state=%u",
+             cam_ctrl[60/4], cam_ctrl[64/4], cam_ctrl[68/4], cam_ctrl[72/4], cam_ctrl[168/4]);
+    cam_ctrl[60 / 4] = 2592; /* max snapshot width (isx006: 2592x1944) */
+    cam_ctrl[64 / 4] = 1944; /* max snapshot height */
+    cam_ctrl[68 / 4] = 1280; /* max preview width (1280x960) */
+    cam_ctrl[72 / 4] = 960;  /* max preview height */
+    cam_ctrl[168 / 4] = 3;   /* camera state: 3 = ready for query_parms */
+    disk_log("inject_sensor_dimensions: AFTER: snap=%ux%u, prev=%ux%u, state=%u (addr=0x%08x)",
+             cam_ctrl[60/4], cam_ctrl[64/4], cam_ctrl[68/4], cam_ctrl[72/4], cam_ctrl[168/4],
+             (unsigned int)(oem_base + 0x9c7c0));
+    LOGI("inject_sensor_dimensions: oem_base=0x%08x: injected 2592x1944, preview 1280x960, state=3",
+         (unsigned int)oem_base);
+    setup_camera_callbacks();
+}
+
+
+static int my_hooked_ioctl(int fd, int request, ...) {
     void* arg = NULL;
     va_list ap;
     va_start(ap, request);
     arg = va_arg(ap, void*);
     va_end(ap);
 
-    if (!s_real_ioctl) {
-        void* libc = dlopen("libc.so", RTLD_NOW);
-        s_real_ioctl = (int (*)(int, int, ...))dlsym(libc, "ioctl");
+    if ((unsigned int)request != 0x80046d07 && (unsigned int)request != 0x40046d0e && (unsigned int)request != 0x40046d02) {
+        disk_log("ioctl ENTER: fd=%d, req=0x%08x, arg=%p", fd, (unsigned int)request, arg);
     }
 
     if ((unsigned int)request == 0x80046d24) { /* MSM_CAM_IOCTL_GET_CAMERA_INFO */
-        LOGI("ioctl hook: intercepted MSM_CAM_IOCTL_GET_CAMERA_INFO (0x80046d24)!");
+        disk_log("ioctl INTERCEPTED MSM_CAM_IOCTL_GET_CAMERA_INFO (0x80046d24)!");
+        LOGI("my_hooked_ioctl: INTERCEPTED MSM_CAM_IOCTL_GET_CAMERA_INFO (0x80046d24)!");
         struct cam_info {
             int num_cameras;
             uint8_t has_3d_support[5];
@@ -159,77 +308,1432 @@ int ioctl(int fd, int request, ...) {
             info->is_internal_cam[0] = 0; /* back camera */
             info->s_mount_angle[0] = 90;
             info->video_dev_name[0] = "/dev/video0";
-            LOGI("ioctl hook: returned num_cameras=1, mount_angle=90");
+            disk_log("ioctl INTERCEPTED: returning num_cameras=1, video_dev=/dev/video0");
+            LOGI("my_hooked_ioctl: returned num_cameras=1, mount_angle=90, video_dev=/dev/video0");
             return 0;
         }
     }
-    return s_real_ioctl(fd, request, arg);
+
+    if ((unsigned int)request == 0x80046d01) { /* MSM_CAM_IOCTL_GET_SENSOR_INFO */
+        disk_log("ioctl INTERCEPTED MSM_CAM_IOCTL_GET_SENSOR_INFO (0x80046d01)!");
+        LOGI("my_hooked_ioctl: INTERCEPTED MSM_CAM_IOCTL_GET_SENSOR_INFO (0x80046d01)!");
+        /* Gingerbread struct is exactly 36 bytes: 32 bytes name + 4 bytes flags */
+        struct gb_camsensor_info {
+            char name[32];
+            uint8_t flash_enabled;
+            uint8_t strobe_flash_enabled;
+            uint8_t actuator_enabled;
+            uint8_t ispif_supported;
+        };
+        struct gb_camsensor_info *info = (struct gb_camsensor_info *)arg;
+        if (info) {
+            memset(info, 0, sizeof(*info));
+            strcpy(info->name, "isx006");
+            info->flash_enabled = 1;
+            info->strobe_flash_enabled = 0;
+            info->actuator_enabled = 0;
+            info->ispif_supported = 0;
+            disk_log("ioctl INTERCEPTED MSM_CAM_IOCTL_GET_SENSOR_INFO: returned isx006 (36 bytes) successfully!");
+            LOGI("my_hooked_ioctl: returned isx006 (36 bytes) successfully!");
+            return 0;
+        }
+    }
+
+    if ((unsigned int)request == 0x40046d02 || (unsigned int)request == 0x40046d03) { /* MSM_CAM_IOCTL_REGISTER_PMEM / UNREGISTER_PMEM */
+        struct shim_pmem_info {
+            int type;
+            int fd;
+            void *vaddr;
+            uint32_t y_off;
+            uint32_t cbcr_off;
+            uint8_t active;
+        };
+        struct shim_pmem_info *pinfo = (struct shim_pmem_info *)arg;
+        if (pinfo) {
+            static int s_pmem_cnt = 0;
+            if ((++s_pmem_cnt % 60) == 1) {
+                disk_log("ioctl INTERCEPTED PMEM (0x%08x) on fd=%d: type=%d, fd=%d, vaddr=%p -> 0 (cnt=%d)",
+                         (unsigned int)request, fd, pinfo->type, pinfo->fd, pinfo->vaddr, s_pmem_cnt);
+            }
+        }
+        return 0;
+    }
+
+    if ((unsigned int)request == 0x40046d20) { /* MSM_CAM_IOCTL_FLASH_CTRL */
+        disk_log("ioctl INTERCEPTED MSM_CAM_IOCTL_FLASH_CTRL (0x40046d20) -> 0");
+        LOGI("my_hooked_ioctl: INTERCEPTED MSM_CAM_IOCTL_FLASH_CTRL (0x40046d20) -> 0");
+        return 0;
+    }
+
+    if ((unsigned int)request == 0x80046d07) { /* MSM_CAM_IOCTL_GETFRAME */
+        struct gb_msm_frame *f = (struct gb_msm_frame *)arg;
+        if (f && g_shim_buffer_count > 0) {
+            int max_bufs = g_shim_buffer_count > 6 ? 6 : g_shim_buffer_count;
+            int idx = g_frame_index;
+            g_frame_index = (g_frame_index + 1) % max_bufs;
+
+            memset(f, 0, sizeof(*f));
+            clock_gettime(CLOCK_MONOTONIC, &f->ts);
+            f->path = 1; /* OUTPUT_TYPE_P = BIT(0) = 1 (preview) */
+            f->type = 0;
+            f->buffer = (unsigned long)g_shim_buffers[idx].base;
+            f->phy_offset = g_shim_buffers[idx].offset;
+            f->y_off = 0;
+            f->cbcr_off = g_shim_preview_w * g_shim_preview_h;
+            f->fd = g_shim_buffers[idx].fd;
+            f->cropinfo = &g_shim_crop;
+            f->croplen = sizeof(g_shim_crop);
+            f->frame_id = ++g_frame_seq;
+
+            /* Leave buffer as-is — real sensor data comes via enqueue_buffer path */
+
+            setup_camera_callbacks();
+            if ((g_frame_seq % 30) == 1) {
+                disk_log("ioctl GETFRAME (0x80046d07): idx=%d, seq=%u", idx, g_frame_seq);
+            }
+            return 0;
+        } else {
+            disk_log("ioctl GETFRAME: arg=%p, count=%d -> -EINVAL", f, g_shim_buffer_count);
+            return -EINVAL;
+        }
+    }
+
+    if ((unsigned int)request == 0x40046d0e) { /* MSM_CAM_IOCTL_RELEASE_FRAME_BUFFER */
+        return 0;
+    }
+
+    if ((unsigned int)request == 0x40046d04 || (unsigned int)request == 0x40046d18) { /* MSM_CAM_IOCTL_CTRL_COMMAND / CTRL_COMMAND_2 */
+        struct gb_ctrl_cmd {
+            uint16_t type;
+            uint16_t length;
+            void *value;
+            uint16_t status;
+            uint32_t timeout_ms;
+            int resp_fd;
+        };
+        struct gb_ctrl_cmd *cmd = (struct gb_ctrl_cmd *)arg;
+        if (cmd) {
+            disk_log("ioctl CTRL_COMMAND (0x%08x): type=%u, len=%u, val=%p, timeout=%u, resp_fd=%d",
+                     (unsigned int)request, cmd->type, cmd->length, cmd->value, cmd->timeout_ms, cmd->resp_fd);
+            LOGI("my_hooked_ioctl: CTRL_COMMAND (0x%08x): type=%u, len=%u, val=%p, timeout=%u, resp_fd=%d",
+                 (unsigned int)request, cmd->type, cmd->length, cmd->value, cmd->timeout_ms, cmd->resp_fd);
+            if (cmd->value && cmd->length > 0) {
+                char hexbuf[128] = {0};
+                int print_len = cmd->length > 16 ? 16 : cmd->length;
+                for (int i = 0; i < print_len; i++) {
+                    sprintf(hexbuf + i*3, "%02x ", ((unsigned char*)cmd->value)[i]);
+                }
+                disk_log("ioctl CTRL_COMMAND data[%d]: %s", cmd->length, hexbuf);
+                LOGI("my_hooked_ioctl: CTRL_COMMAND data[%d]: %s", cmd->length, hexbuf);
+            }
+            inject_sensor_dimensions();
+            cmd->status = 1; /* CAMERA_STATUS_SUCCESS (1) */
+            return 0;
+        }
+    }
+
+    init_real_libc();
+    if (!g_orig_ioctl) {
+        disk_log("ioctl ERROR: g_orig_ioctl is NULL!");
+        LOGE("my_hooked_ioctl: g_orig_ioctl is NULL!");
+        return -1;
+    }
+
+    if ((unsigned int)request != 0x80046d07 && (unsigned int)request != 0x40046d0e && (unsigned int)request != 0x40046d02) {
+        disk_log("ioctl CALLING REAL: fd=%d, req=0x%08x", fd, (unsigned int)request);
+    }
+    int ret = g_orig_ioctl(fd, request, arg);
+    if ((unsigned int)request != 0x80046d07 && (unsigned int)request != 0x40046d0e && (unsigned int)request != 0x40046d02) {
+        disk_log("ioctl REAL RETURNED: fd=%d, req=0x%08x -> ret=%d (errno=%d)", fd, (unsigned int)request, ret, errno);
+    }
+    return ret;
 }
 
-/* Forwarding to Qualcomm camera.msm7x27a.so */
-/* Note: Qualcomm HAL_openCameraHardware returns raw CameraHardwareInterface* in r0, takes cameraId in r0 */
-typedef android::CameraHardwareInterface* (*qcom_open_raw_t)(int);
+int ioctl(int fd, int request, ...) {
+    void* arg = NULL;
+    va_list ap;
+    va_start(ap, request);
+    arg = va_arg(ap, void*);
+    va_end(ap);
+    return my_hooked_ioctl(fd, request, arg);
+}
+
+static int my_hooked_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout) {
+    if (g_preview_active && readfds && g_frame_fd >= 0 && FD_ISSET(g_frame_fd, readfds)) {
+        usleep(33000); /* ~30 FPS */
+        if (!g_preview_active) {
+            init_real_libc();
+            return g_orig_select ? g_orig_select(nfds, readfds, writefds, exceptfds, timeout) : 0;
+        }
+        FD_ZERO(readfds);
+        FD_SET(g_frame_fd, readfds);
+        if (writefds) FD_ZERO(writefds);
+        if (exceptfds) FD_ZERO(exceptfds);
+        /* simulated frame ready */
+        return 1;
+    }
+
+    init_real_libc();
+    if (!g_orig_select) {
+        LOGE("my_hooked_select: g_orig_select is NULL!");
+        return -1;
+    }
+    return g_orig_select(nfds, readfds, writefds, exceptfds, timeout);
+}
+
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout) {
+    return my_hooked_select(nfds, readfds, writefds, exceptfds, timeout);
+}
+
+static int my_hooked_open(const char* pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+
+    disk_log("open ENTER: path='%s', flags=0x%x", pathname ? pathname : "(null)", flags);
+    bool is_config = (pathname && strstr(pathname, "/dev/msm_camera/config"));
+    bool is_frame = (pathname && strstr(pathname, "/dev/msm_camera/frame"));
+    LOGI("my_hooked_open ENTER: path='%s', flags=0x%x", pathname ? pathname : "(null)", flags);
+
+    if (pathname && strstr(pathname, "/dev/msm_camera/control")) {
+        disk_log("open REDIRECT: %s -> /dev/video100", pathname);
+        LOGI("my_hooked_open: redirecting %s -> /dev/video100", pathname);
+        pathname = "/dev/video100";
+    } else if (pathname && strstr(pathname, "/dev/msm_camera/frame")) {
+        disk_log("open REDIRECT: %s -> /dev/video0", pathname);
+        LOGI("my_hooked_open: redirecting %s -> /dev/video0", pathname);
+        pathname = "/dev/video0";
+    }
+
+    init_real_libc();
+    if (!g_orig_open) {
+        disk_log("open ERROR: g_orig_open is NULL!");
+        LOGE("my_hooked_open: g_orig_open is NULL!");
+        return -1;
+    }
+
+    disk_log("open CALLING REAL: path='%s'", pathname ? pathname : "(null)");
+    int fd = g_orig_open(pathname, flags, mode);
+    disk_log("open REAL RETURNED: path='%s' -> fd=%d (errno=%d)", pathname ? pathname : "(null)", fd, errno);
+    LOGI("my_hooked_open EXIT: pathname=%s, flags=0x%x -> fd=%d", pathname ? pathname : "(null)", flags, fd);
+    if (fd >= 0) {
+        if (is_config) {
+            g_config_fd = fd;
+            disk_log("my_hooked_open: captured g_config_fd=%d", g_config_fd);
+        } else if (is_frame || (pathname && strstr(pathname, "video0"))) {
+            g_frame_fd = fd;
+            disk_log("my_hooked_open: captured g_frame_fd=%d", g_frame_fd);
+        }
+    }
+    return fd;
+}
+
+static bool patch_got_entry(const char* libname, uintptr_t offset, void* new_func) {
+    uintptr_t base = get_lib_base(libname);
+    if (!base) {
+        disk_log("patch_got_entry: %s not found in /proc/self/maps", libname);
+        LOGW("patch_got_entry: %s not found in /proc/self/maps", libname);
+        return false;
+    }
+    uintptr_t target_addr = base + offset;
+    uintptr_t page_start = target_addr & ~(4096 - 1);
+    if (mprotect((void*)page_start, 4096 * 2, PROT_READ | PROT_WRITE) < 0) {
+        disk_log("patch_got_entry: mprotect failed on %s (0x%08x): %s", libname, (unsigned int)page_start, strerror(errno));
+        LOGE("patch_got_entry: mprotect failed on %s (0x%08x): %s", libname, (unsigned int)page_start, strerror(errno));
+        return false;
+    }
+    disk_log("patch_got_entry: %s + 0x%08x (0x%08x): %p -> %p", libname, (unsigned int)offset, (unsigned int)target_addr, *(void**)target_addr, new_func);
+    LOGI("patch_got_entry: %s + 0x%08x (0x%08x): %p -> %p", libname, (unsigned int)offset, (unsigned int)target_addr, *(void**)target_addr, new_func);
+    *(void**)target_addr = new_func;
+    return true;
+}
+
+/* ========================================================================= */
+/* Android 4.0 ICS C Camera HAL Types & Functions                            */
+/* ========================================================================= */
+
+struct camera_device;
+
+typedef void (*camera_notify_callback)(int32_t msg_type,
+        int32_t ext1,
+        int32_t ext2,
+        void *user);
+
+typedef struct camera_memory {
+    void *data;
+    size_t size;
+    void *handle;
+    void (*release)(struct camera_memory *mem);
+} camera_memory_t;
+
+typedef void (*camera_data_callback)(int32_t msg_type,
+        const camera_memory_t *data, unsigned int index,
+        void *metadata,
+        void *user);
+
+typedef void (*camera_data_timestamp_callback)(int64_t timestamp,
+        int32_t msg_type,
+        const camera_memory_t *data, unsigned int index,
+        void *user);
+
+typedef camera_memory_t* (*camera_request_memory)(int fd, size_t buf_size,
+        unsigned int num_bufs,
+        void *user);
+
+struct preview_stream_ops {
+    int (*dequeue_buffer)(struct preview_stream_ops* w,
+                          buffer_handle_t** buffer, int* stride);
+    int (*enqueue_buffer)(struct preview_stream_ops* w,
+                          buffer_handle_t* buffer);
+    int (*cancel_buffer)(struct preview_stream_ops* w,
+                         buffer_handle_t* buffer);
+    int (*set_buffer_count)(struct preview_stream_ops* w, int count);
+    int (*set_buffers_geometry)(struct preview_stream_ops* pw,
+                                int w, int h, int format);
+    int (*set_crop)(struct preview_stream_ops *w,
+                    int left, int top, int right, int bottom);
+    int (*set_usage)(struct preview_stream_ops* w, int usage);
+    int (*set_swap_interval)(struct preview_stream_ops *w, int interval);
+    int (*get_min_undequeued_buffer_count)(const struct preview_stream_ops *w,
+                                           int *count);
+    int (*lock_buffer)(struct preview_stream_ops* w,
+                       buffer_handle_t* buffer);
+};
+
+typedef struct camera_device_ops {
+    int (*set_preview_window)(struct camera_device *,
+            struct preview_stream_ops *window);
+    void (*set_callbacks)(struct camera_device *,
+            camera_notify_callback notify_cb,
+            camera_data_callback data_cb,
+            camera_data_timestamp_callback data_cb_timestamp,
+            camera_request_memory get_memory,
+            void *user);
+    void (*enable_msg_type)(struct camera_device *, int32_t msg_type);
+    void (*disable_msg_type)(struct camera_device *, int32_t msg_type);
+    int (*msg_type_enabled)(struct camera_device *, int32_t msg_type);
+    int (*start_preview)(struct camera_device *);
+    void (*stop_preview)(struct camera_device *);
+    int (*preview_enabled)(struct camera_device *);
+    int (*store_meta_data_in_buffers)(struct camera_device *, int enable);
+    int (*start_recording)(struct camera_device *);
+    void (*stop_recording)(struct camera_device *);
+    int (*recording_enabled)(struct camera_device *);
+    void (*release_recording_frame)(struct camera_device *,
+                    const void *opaque);
+    int (*auto_focus)(struct camera_device *);
+    int (*cancel_auto_focus)(struct camera_device *);
+    int (*take_picture)(struct camera_device *);
+    int (*cancel_picture)(struct camera_device *);
+    int (*set_parameters)(struct camera_device *, const char *parms);
+    char *(*get_parameters)(struct camera_device *);
+    void (*put_parameters)(struct camera_device *, char *);
+    int (*send_command)(struct camera_device *,
+                int32_t cmd, int32_t arg1, int32_t arg2);
+    void (*release)(struct camera_device *);
+    int (*dump)(struct camera_device *, int fd);
+} camera_device_ops_t;
+
+typedef struct camera_device {
+    hw_device_t common;
+    camera_device_ops_t *ops;
+    void *priv;
+} camera_device_t;
+
+typedef int (*camera_device_open_fn_t)(const struct hw_module_t* module, const char* name, struct hw_device_t** device);
+typedef int (*close_camera_device_fn_t)(struct hw_device_t* device);
 typedef void (*qcom_info_t)(int, struct android::CameraInfo*);
 typedef int (*qcom_num_t)();
+typedef void* (*qcom_open_raw_t)(int);
 
 static void* g_hal_handle = NULL;
+static struct hw_module_t* g_hmi = NULL;
+static camera_device_open_fn_t g_cam_open_fn = NULL;
+static close_camera_device_fn_t g_cam_close_fn = NULL;
 static qcom_open_raw_t g_open_fn = NULL;
 static qcom_info_t g_info_fn = NULL;
 static qcom_num_t g_num_fn = NULL;
 
+#include <gralloc_priv.h>
+
+/* ========================================================================= */
+/* V4L2 Event Dispatcher for MSM Kernel Server (/dev/video100)               */
+/* ========================================================================= */
+
+#ifndef V4L2_EVENT_ALL
+#define V4L2_EVENT_ALL 0
+#endif
+
+struct shim_v4l2_event_subscription {
+    uint32_t type;
+    uint32_t id;
+    uint32_t flags;
+    uint32_t reserved[5];
+};
+
+struct shim_v4l2_event {
+    uint32_t type;
+    union {
+        uint8_t data[64];
+    } u;
+    uint32_t pending;
+    uint32_t sequence;
+    struct timespec timestamp;
+    uint32_t id;
+    uint32_t reserved[8];
+};
+
+#define SHIM_VIDIOC_DQEVENT _IOR('V', 89, struct shim_v4l2_event)
+#define SHIM_VIDIOC_SUBSCRIBE_EVENT _IOW('V', 90, struct shim_v4l2_event_subscription)
+
+#define SHIM_BASE_VIDIOC_PRIVATE 192
+#define SHIM_MSM_CAM_V4L2_IOCTL_CTRL_CMD_DONE _IOWR('V', SHIM_BASE_VIDIOC_PRIVATE + 4, struct shim_msm_camera_v4l2_ioctl_t *)
+#define SHIM_MSM_CAM_V4L2_IOCTL_GET_EVENT_PAYLOAD _IOWR('V', SHIM_BASE_VIDIOC_PRIVATE + 5, struct shim_msm_camera_v4l2_ioctl_t *)
+
+struct shim_msm_camera_v4l2_ioctl_t {
+    void* ioctl_ptr;
+};
+
+struct shim_msm_ctrl_cmd {
+    uint16_t type;
+    uint16_t length;
+    void *value;
+    uint16_t status;
+    uint32_t timeout_ms;
+    int resp_fd;
+    int vnode_id;
+    int queue_idx;
+    uint32_t evt_id;
+    uint32_t stream_type;
+    int config_ident;
+};
+
+struct shim_msm_cam_evt_msg {
+    unsigned short type;
+    unsigned short msg_id;
+    unsigned int len;
+    uint32_t frame_id;
+    void *data;
+    struct timespec timestamp;
+};
+
+struct shim_msm_isp_event_ctrl {
+    unsigned short resptype;
+    union {
+        struct shim_msm_cam_evt_msg isp_msg;
+        struct shim_msm_ctrl_cmd ctrl;
+        uint8_t raw[128];
+    } isp_data;
+};
+
+static pthread_t g_server_thread = 0;
+static int g_server_fd = -1;
+static volatile bool g_server_running = false;
+
+static void* server_event_worker(void* arg) {
+    int fd = (int)(intptr_t)arg;
+    disk_log("server_event_worker started on fd=%d", fd);
+
+    struct shim_v4l2_event_subscription sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.type = V4L2_EVENT_ALL;
+    int ret = g_orig_ioctl ? g_orig_ioctl(fd, SHIM_VIDIOC_SUBSCRIBE_EVENT, &sub)
+                           : ioctl(fd, SHIM_VIDIOC_SUBSCRIBE_EVENT, &sub);
+    disk_log("server_event_worker: subscribed to V4L2_EVENT_ALL ret=%d (errno=%d)", ret, errno);
+
+    while (g_server_running) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLPRI | POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 100);
+        if (pr <= 0) {
+            continue;
+        }
+
+        if (pfd.revents & (POLLPRI | POLLIN)) {
+            struct shim_v4l2_event ev;
+            memset(&ev, 0, sizeof(ev));
+            int rc = g_orig_ioctl ? g_orig_ioctl(fd, SHIM_VIDIOC_DQEVENT, &ev)
+                                  : ioctl(fd, SHIM_VIDIOC_DQEVENT, &ev);
+            if (rc < 0) {
+                if (errno != EINTR && errno != EAGAIN) {
+                    disk_log("server_event_worker: DQEVENT failed: %s (%d)", strerror(errno), errno);
+                }
+                continue;
+            }
+
+            int q_idx = ev.u.data[0];
+            disk_log("server_event_worker: GOT EVENT type=0x%x, q_idx=%d", ev.type, q_idx);
+
+            struct shim_msm_isp_event_ctrl u_isp_event;
+            memset(&u_isp_event, 0, sizeof(u_isp_event));
+            u_isp_event.isp_data.ctrl.queue_idx = q_idx;
+
+            struct shim_msm_camera_v4l2_ioctl_t v4l2_ioctl;
+            v4l2_ioctl.ioctl_ptr = &u_isp_event;
+
+            rc = g_orig_ioctl ? g_orig_ioctl(fd, SHIM_MSM_CAM_V4L2_IOCTL_GET_EVENT_PAYLOAD, &v4l2_ioctl)
+                              : ioctl(fd, SHIM_MSM_CAM_V4L2_IOCTL_GET_EVENT_PAYLOAD, &v4l2_ioctl);
+            disk_log("server_event_worker: GET_EVENT_PAYLOAD ret=%d, ctrl.type=%d, evt_id=%d",
+                     rc, u_isp_event.isp_data.ctrl.type, u_isp_event.isp_data.ctrl.evt_id);
+
+            struct shim_msm_ctrl_cmd cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.type = u_isp_event.isp_data.ctrl.type;
+            cmd.queue_idx = q_idx;
+            cmd.evt_id = u_isp_event.isp_data.ctrl.evt_id;
+            cmd.status = 1; /* CAMERA_STATUS_SUCCESS */
+
+            v4l2_ioctl.ioctl_ptr = &cmd;
+            rc = g_orig_ioctl ? g_orig_ioctl(fd, SHIM_MSM_CAM_V4L2_IOCTL_CTRL_CMD_DONE, &v4l2_ioctl)
+                              : ioctl(fd, SHIM_MSM_CAM_V4L2_IOCTL_CTRL_CMD_DONE, &v4l2_ioctl);
+            disk_log("server_event_worker: CTRL_CMD_DONE ret=%d (for type=%d, evt_id=%d)",
+                     rc, cmd.type, cmd.evt_id);
+        }
+    }
+    disk_log("server_event_worker exiting");
+    return NULL;
+}
+
+static void start_server_thread_if_needed() {
+    if (g_server_running) return;
+    init_real_libc();
+
+    g_server_fd = g_orig_open ? g_orig_open("/dev/video100", O_RDWR) : open("/dev/video100", O_RDWR);
+    if (g_server_fd < 0) {
+        disk_log("start_server_thread: failed to open /dev/video100: %s", strerror(errno));
+        return;
+    }
+    disk_log("start_server_thread: opened /dev/video100 fd=%d", g_server_fd);
+    g_server_running = true;
+    if (pthread_create(&g_server_thread, NULL, server_event_worker, (void*)(intptr_t)g_server_fd) != 0) {
+        disk_log("start_server_thread: pthread_create failed: %s", strerror(errno));
+        g_server_running = false;
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+}
+
+/* ========================================================================= */
+/* Camera Frame Delivery and Notification Callbacks Hook                     */
+/* ========================================================================= */
+
+static void (*g_orig_preview_thunk)(void*) = NULL;
+static void (*g_orig_recording_thunk)(void*) = NULL;
+static void (*g_orig_error_thunk)(void*) = NULL;
+static void (*g_orig_stats_thunk)(void*) = NULL;
+static void (*g_orig_event_thunk)(void*) = NULL;
+
+namespace android {
+    class QcomCameraAdapter;
+}
+static android::QcomCameraAdapter* g_active_adapter = NULL;
+static int g_cb_frame_count = 0;
+static int g_enqueue_count = 0;
+static void adapter_deliver_frame(void* frame);
+
+static void my_preview_frame_cb(void* frame) {
+    g_cb_frame_count++;
+    if (g_cb_frame_count <= 10 || (g_cb_frame_count % 30) == 0) {
+        disk_log("my_preview_frame_cb #%d CALLED! frame=%p", g_cb_frame_count, frame);
+    }
+
+    if (g_orig_preview_thunk) {
+        g_orig_preview_thunk(frame);
+    }
+
+    adapter_deliver_frame(frame);
+}
+
+static void setup_camera_callbacks() {
+    uintptr_t cam_base = get_lib_base("camera.msm7x27a.so");
+    uintptr_t oem_base = get_lib_base("liboemcamera.so");
+
+    if (!cam_base || !oem_base) {
+        return;
+    }
+
+    void* p_preview_thunk   = (void*)(cam_base + 0x15ec5);
+    void* p_recording_thunk = (void*)(cam_base + 0x15db1);
+    void* p_error_thunk     = (void*)(cam_base + 0x15dc5);
+    void* p_stats_thunk     = (void*)(cam_base + 0x15ead);
+    void* p_event_thunk     = (void*)(cam_base + 0x15e15);
+
+    g_orig_preview_thunk   = (void (*)(void*))p_preview_thunk;
+    g_orig_recording_thunk = (void (*)(void*))p_recording_thunk;
+    g_orig_error_thunk     = (void (*)(void*))p_error_thunk;
+    g_orig_stats_thunk     = (void (*)(void*))p_stats_thunk;
+    g_orig_event_thunk     = (void (*)(void*))p_event_thunk;
+
+    /* Note: p_hw[52] in QualcommCameraHardware is mInitialPreviewRunning.
+     * Do NOT set it to 1, otherwise setPreviewWindow triggers an extra
+     * getBuffersAndStartPreviewEv(), causing startPreview to deadlock in pthread_cond_wait! */
+
+    // 1. Populate camera.msm7x27a.so mCamNotify
+    void** p_cam_notify = NULL;
+    if (g_hal_handle) {
+        p_cam_notify = (void**)dlsym(g_hal_handle, "_ZN7android10mCamNotifyE");
+    }
+    if (!p_cam_notify) {
+        p_cam_notify = (void**)(cam_base + 0x21f48);
+    }
+    if (p_cam_notify) {
+        p_cam_notify[0] = p_event_thunk;
+        p_cam_notify[1] = (void*)&my_preview_frame_cb;
+        p_cam_notify[2] = (void*)&my_preview_frame_cb;
+        p_cam_notify[3] = p_error_thunk;
+        p_cam_notify[4] = p_stats_thunk;
+    }
+
+    // 2. Populate liboemcamera.so notify pointer at oem_base + 0x9c7c0
+    void*** pp_oem_ctrl = (void***)(oem_base + 0x9c7c0);
+    void** p_oem_notify = *pp_oem_ctrl;
+    if (!p_oem_notify && p_cam_notify) {
+        *pp_oem_ctrl = p_cam_notify;
+        p_oem_notify = p_cam_notify;
+    }
+    if (p_oem_notify) {
+        p_oem_notify[0] = p_event_thunk;
+        p_oem_notify[1] = (void*)&my_preview_frame_cb;
+        p_oem_notify[2] = (void*)&my_preview_frame_cb;
+        p_oem_notify[3] = p_error_thunk;
+        p_oem_notify[4] = p_stats_thunk;
+    }
+
+    static bool s_logged = false;
+    if (!s_logged) {
+        disk_log("setup_camera_callbacks: SUCCESS! cam_base=0x%08x, oem_base=0x%08x, p_cam_notify=%p, p_oem_notify=%p [1]=%p",
+                 (unsigned int)cam_base, (unsigned int)oem_base, p_cam_notify, p_oem_notify,
+                 p_oem_notify ? p_oem_notify[1] : NULL);
+        s_logged = true;
+    }
+}
+
 static void ensure_hal_loaded() {
     if (g_hal_handle) return;
+
+    disk_log("ensure_hal_loaded ENTER");
+    /* Initialize real libc function pointers before patching any GOT entries */
+    init_real_libc();
+
+    /* Ensure device nodes exist and have proper permissions */
+    mkdir("/dev/msm_camera", 0775);
+    unlink("/dev/msm_camera/control0");
+    symlink("/dev/video100", "/dev/msm_camera/control0");
+    unlink("/dev/msm_camera/frame0");
+    symlink("/dev/video0", "/dev/msm_camera/frame0");
+    chmod("/dev/msm_camera/control0", 0666);
+    chmod("/dev/msm_camera/frame0", 0666);
+    chmod("/dev/msm_camera/config0", 0666);
+    chmod("/dev/video0", 0666);
+    chmod("/dev/video1", 0666);
+    chmod("/dev/video100", 0666);
+    chmod("/dev/pmem", 0666);
+    chmod("/dev/pmem_adsp", 0666);
+
+    start_server_thread_if_needed();
+
+    disk_log("Loading /system/lib/hw/camera.msm7x27a.so ...");
     LOGI("Loading /system/lib/hw/camera.msm7x27a.so ...");
     g_hal_handle = dlopen("/system/lib/hw/camera.msm7x27a.so", RTLD_NOW | RTLD_GLOBAL);
     if (!g_hal_handle) {
+        disk_log("Failed to dlopen camera.msm7x27a.so: %s", dlerror());
         LOGE("Failed to dlopen /system/lib/hw/camera.msm7x27a.so: %s", dlerror());
         return;
     }
+
+    disk_log("Pre-loading liboemcamera.so ...");
+    LOGI("Pre-loading liboemcamera.so ...");
+    void* oem = dlopen("liboemcamera.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!oem) {
+        disk_log("Failed to pre-dlopen liboemcamera.so: %s", dlerror());
+        LOGW("Failed to pre-dlopen liboemcamera.so: %s", dlerror());
+    }
+
+    /* Install GOT hooks for camera.msm7x27a.so and liboemcamera.so */
+    patch_got_entry("camera.msm7x27a.so", 0x21b28, (void*)&my_hooked_ioctl);
+    patch_got_entry("camera.msm7x27a.so", 0x21bc0, (void*)&my_hooked_open);
+    patch_got_entry("liboemcamera.so", 0x864e0, (void*)&my_hooked_ioctl);
+    patch_got_entry("liboemcamera.so", 0x864fc, (void*)&my_hooked_open);
+    patch_got_entry("liboemcamera.so", 0x86540, (void*)&my_hooked_select);
+
+    g_hmi = (struct hw_module_t*)dlsym(g_hal_handle, "HMI");
+    g_cam_open_fn = (camera_device_open_fn_t)dlsym(g_hal_handle, "camera_device_open");
+    g_cam_close_fn = (close_camera_device_fn_t)dlsym(g_hal_handle, "close_camera_device");
     g_open_fn = (qcom_open_raw_t)dlsym(g_hal_handle, "HAL_openCameraHardware");
     g_info_fn = (qcom_info_t)dlsym(g_hal_handle, "HAL_getCameraInfo");
     g_num_fn = (qcom_num_t)dlsym(g_hal_handle, "HAL_getNumberOfCameras");
-    LOGI("Qualcomm HAL loaded! open=%p, info=%p, num=%p", g_open_fn, g_info_fn, g_num_fn);
+    disk_log("Qualcomm HAL loaded! HMI=%p, cam_open=%p, cam_close=%p, raw_open=%p, info=%p, num=%p",
+             g_hmi, g_cam_open_fn, g_cam_close_fn, g_open_fn, g_info_fn, g_num_fn);
+    LOGI("Qualcomm HAL loaded! HMI=%p, cam_open=%p, cam_close=%p, raw_open=%p, info=%p, num=%p",
+         g_hmi, g_cam_open_fn, g_cam_close_fn, g_open_fn, g_info_fn, g_num_fn);
+    inject_sensor_dimensions();
+    setup_camera_callbacks();
 }
 
+} /* extern "C" */
+
+namespace android {
+
+class QcomCameraAdapter : public CameraHardwareInterface {
+private:
+    camera_device_t* m_dev;
+
+    notify_callback m_notify_cb;
+    data_callback m_data_cb;
+    data_callback_timestamp m_data_cb_ts;
+    void* m_user;
+
+    struct shim_buffer_t {
+        private_handle_t* handle;
+        int pmem_fd;
+        void* base;
+        size_t size;
+        size_t offset;
+        sp<IMemory> mem;
+        bool queued;
+    };
+    static const int MAX_BUFFERS = 8;
+    shim_buffer_t m_buffers[MAX_BUFFERS];
+    int m_buffer_count;
+    int m_preview_w;
+    int m_preview_h;
+    int m_preview_format;
+    sp<MemoryHeapBase> m_preview_heap;
+    int m_master_pmem_fd;
+    void* m_master_base;
+    int m_last_hal_buf_idx; // Last buffer index used by HAL (via s_get_memory)
+    size_t m_master_size;
+
+    struct shim_stream_ops_t {
+        struct preview_stream_ops ops;
+        QcomCameraAdapter* adapter;
+    };
+    shim_stream_ops_t m_stream_ops;
+
+    static void s_notify_cb(int32_t msg_type, int32_t ext1, int32_t ext2, void *user) {
+        disk_log("s_notify_cb: msg_type=0x%x, ext1=%d, ext2=%d", msg_type, ext1, ext2);
+        if (g_start_preview_in_progress) {
+            disk_log("s_notify_cb: dropped during startPreview to prevent deadlock");
+            return;
+        }
+        QcomCameraAdapter* self = (QcomCameraAdapter*)user;
+        if (self && self->m_notify_cb) {
+            self->m_notify_cb(msg_type, ext1, ext2, self->m_user);
+        }
+    }
+
+    static void s_data_cb(int32_t msg_type, const camera_memory_t *data, unsigned int index,
+                          void *metadata, void *user) {
+        if (g_start_preview_in_progress) {
+            return;
+        }
+        if (msg_type == CAMERA_MSG_PREVIEW_FRAME) {
+            // Preview frames are handled exclusively by preview_stream_ops::enqueue_buffer
+            return;
+        }
+        static int s_data_count = 0;
+        s_data_count++;
+        if ((s_data_count % 30) == 1) {
+            disk_log("s_data_cb #%d: msg_type=0x%x, index=%d", s_data_count, msg_type, index);
+        }
+        QcomCameraAdapter* self = (QcomCameraAdapter*)user;
+        if (!self || !self->m_data_cb) return;
+
+        sp<MemoryHeapBase> heap;
+        sp<MemoryBase> mem;
+        if (data && data->data && data->size > 0) {
+            heap = new MemoryHeapBase(data->size, 0, "cam_data");
+            memcpy(heap->getBase(), data->data, data->size);
+            mem = new MemoryBase(heap, 0, data->size);
+        }
+        self->m_data_cb(msg_type, mem, self->m_user);
+    }
+
+    static void s_data_cb_ts(int64_t timestamp, int32_t msg_type,
+                             const camera_memory_t *data, unsigned int index, void *user) {
+        if (g_start_preview_in_progress) {
+            return;
+        }
+        disk_log("s_data_cb_ts: ts=%lld, msg_type=0x%x", (long long)timestamp, msg_type);
+        QcomCameraAdapter* self = (QcomCameraAdapter*)user;
+        if (!self || !self->m_data_cb_ts) return;
+
+        sp<MemoryHeapBase> heap;
+        sp<MemoryBase> mem;
+        if (data && data->data && data->size > 0) {
+            heap = new MemoryHeapBase(data->size, 0, "cam_data_ts");
+            memcpy(heap->getBase(), data->data, data->size);
+            mem = new MemoryBase(heap, 0, data->size);
+        }
+        self->m_data_cb_ts(timestamp, msg_type, mem, self->m_user);
+    }
+
+    struct shim_cam_mem {
+        camera_memory_t mem;
+        void* mapped;
+        size_t size;
+        bool is_mmap;
+        bool is_pmem_sub;
+    };
+
+    static void s_mem_release(camera_memory_t* mem) {
+        if (!mem) return;
+        shim_cam_mem* m = (shim_cam_mem*)mem->handle;
+        if (m) {
+            if (!m->is_pmem_sub) {
+                if (m->is_mmap && m->mapped) {
+                    munmap(m->mapped, m->size);
+                } else if (!m->is_mmap && m->mapped) {
+                    free(m->mapped);
+                }
+            }
+            free(m);
+        }
+    }
+
+    static camera_memory_t* s_get_memory(int fd, size_t buf_size, unsigned int num_bufs, void *user) {
+        static int s_get_mem_count = 0;
+        s_get_mem_count++;
+        if (s_get_mem_count <= 5 || (s_get_mem_count % 30) == 0) {
+            disk_log("s_get_memory #%d: fd=%d, buf_size=%zu, num_bufs=%u, user=%p", s_get_mem_count, fd, buf_size, num_bufs, user);
+        }
+        QcomCameraAdapter* self = (QcomCameraAdapter*)user;
+
+        shim_cam_mem* m = (shim_cam_mem*)calloc(1, sizeof(shim_cam_mem));
+        if (!m) return NULL;
+
+        if (!self) self = g_active_adapter;
+        if (self && self->m_master_pmem_fd >= 0 && fd == self->m_master_pmem_fd) {
+            int matched_idx = -1;
+            for (int i = 0; i < self->m_buffer_count; i++) {
+                if (self->m_buffers[i].offset == buf_size) {
+                    matched_idx = i;
+                    break;
+                }
+            }
+            if (matched_idx < 0) {
+                static int s_pmem_seq = 0;
+                matched_idx = (s_pmem_seq++) % (self->m_buffer_count > 0 ? self->m_buffer_count : 1);
+            }
+
+            self->m_last_hal_buf_idx = matched_idx;
+            m->mapped = self->m_buffers[matched_idx].base;
+            m->size = self->m_buffers[matched_idx].size;
+            m->is_mmap = false;
+            m->is_pmem_sub = true;
+            m->mem.data = m->mapped;
+            m->mem.size = m->size;
+            m->mem.handle = m;
+            m->mem.release = s_mem_release;
+            if (s_get_mem_count <= 5 || (s_get_mem_count % 30) == 0) {
+                disk_log("s_get_memory #%d: matched PMEM sub-buffer %d (offset=%zu) -> data=%p, size=%zu",
+                         s_get_mem_count, matched_idx, self->m_buffers[matched_idx].offset, m->mem.data, m->mem.size);
+            }
+            return &m->mem;
+        }
+
+        if (buf_size == 0) {
+            buf_size = (self && self->m_preview_w > 0 && self->m_preview_h > 0)
+                     ? (self->m_preview_w * self->m_preview_h * 3 / 2)
+                     : (640 * 480 * 3 / 2);
+            buf_size = (buf_size + 4095) & ~4095;
+            if (s_get_mem_count <= 5 || (s_get_mem_count % 30) == 0) {
+                disk_log("s_get_memory #%d: corrected buf_size to %zu", s_get_mem_count, buf_size);
+            }
+        }
+        size_t total = buf_size * (num_bufs > 0 ? num_bufs : 1);
+        m->size = total;
+        m->is_pmem_sub = false;
+
+        if (fd >= 0) {
+            m->mapped = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (m->mapped == MAP_FAILED) {
+                disk_log("s_get_memory: mmap failed on fd %d (size=%zu): %s, using malloc fallback",
+                         fd, total, strerror(errno));
+                m->mapped = malloc(total);
+                m->is_mmap = false;
+                m->mem.data = m->mapped;
+            } else {
+                m->is_mmap = true;
+                m->mem.data = m->mapped;
+            }
+        } else {
+            m->mapped = malloc(total);
+            m->is_mmap = false;
+            m->mem.data = m->mapped;
+        }
+        m->mem.size = total;
+        m->mem.handle = m;
+        m->mem.release = s_mem_release;
+        if (s_get_mem_count <= 5 || (s_get_mem_count % 30) == 0) {
+            disk_log("s_get_memory #%d: allocated mem=%p, data=%p, size=%zu", s_get_mem_count, m, m->mem.data, total);
+        }
+        return &m->mem;
+    }
+
+    // preview_stream_ops trampolines
+    static int s_dequeue_buffer(struct preview_stream_ops* w, buffer_handle_t** buffer, int* stride) {
+        shim_stream_ops_t* shim = (shim_stream_ops_t*)w;
+        return shim->adapter->handle_dequeue_buffer(buffer, stride);
+    }
+
+    static int s_enqueue_buffer(struct preview_stream_ops* w, buffer_handle_t* buffer) {
+        shim_stream_ops_t* shim = (shim_stream_ops_t*)w;
+        return shim->adapter->handle_enqueue_buffer(buffer);
+    }
+
+    static int s_cancel_buffer(struct preview_stream_ops* w, buffer_handle_t* buffer) {
+        shim_stream_ops_t* shim = (shim_stream_ops_t*)w;
+        return shim->adapter->handle_cancel_buffer(buffer);
+    }
+
+    static int s_set_buffer_count(struct preview_stream_ops* w, int count) {
+        shim_stream_ops_t* shim = (shim_stream_ops_t*)w;
+        return shim->adapter->handle_set_buffer_count(count);
+    }
+
+    static int s_set_buffers_geometry(struct preview_stream_ops* pw, int w, int h, int format) {
+        shim_stream_ops_t* shim = (shim_stream_ops_t*)pw;
+        return shim->adapter->handle_set_buffers_geometry(w, h, format);
+    }
+
+    static int s_set_crop(struct preview_stream_ops *w, int left, int top, int right, int bottom) {
+        return 0;
+    }
+
+    static int s_set_usage(struct preview_stream_ops* w, int usage) {
+        return 0;
+    }
+
+    static int s_set_swap_interval(struct preview_stream_ops *w, int interval) {
+        return 0;
+    }
+
+    static int s_get_min_undequeued_buffer_count(const struct preview_stream_ops *w, int *count) {
+        if (count) *count = 1;
+        return 0;
+    }
+
+    static int s_lock_buffer(struct preview_stream_ops* w, buffer_handle_t* buffer) {
+        return 0;
+    }
+
+    int handle_set_buffers_geometry(int w, int h, int format) {
+        disk_log("preview_stream_ops::set_buffers_geometry: %dx%d, format=0x%x", w, h, format);
+        m_preview_w = w;
+        m_preview_h = h;
+        m_preview_format = format;
+        g_shim_preview_w = w;
+        g_shim_preview_h = h;
+        g_shim_crop.in_w = w;
+        g_shim_crop.out_w = w;
+        g_shim_crop.in_h = h;
+        g_shim_crop.out_h = h;
+        return 0;
+    }
+
+    void cleanup_buffers() {
+        g_shim_buffer_count = 0;
+        m_preview_heap.clear();
+        for (int i = 0; i < MAX_BUFFERS; i++) {
+            m_buffers[i].mem.clear();
+            if (m_buffers[i].handle) {
+                delete m_buffers[i].handle;
+                m_buffers[i].handle = NULL;
+            }
+            m_buffers[i].base = NULL;
+            m_buffers[i].size = 0;
+            m_buffers[i].offset = 0;
+            m_buffers[i].pmem_fd = -1;
+            m_buffers[i].queued = false;
+        }
+        if (m_master_base && m_master_size > 0) {
+            munmap(m_master_base, m_master_size);
+            m_master_base = NULL;
+            m_master_size = 0;
+        }
+        if (m_master_pmem_fd >= 0) {
+            close(m_master_pmem_fd);
+            m_master_pmem_fd = -1;
+        }
+    }
+
+    int handle_set_buffer_count(int count) {
+        disk_log("preview_stream_ops::set_buffer_count: count=%d", count);
+        if (count > MAX_BUFFERS) count = MAX_BUFFERS;
+        m_buffer_count = count;
+
+        cleanup_buffers();
+
+        size_t frame_size = (m_preview_w > 0 && m_preview_h > 0)
+                          ? (m_preview_w * m_preview_h * 3 / 2)
+                          : (640 * 480 * 3 / 2);
+        frame_size = (frame_size + 4095) & ~4095;
+        size_t total_size = frame_size * count;
+
+        m_master_pmem_fd = open("/dev/pmem_adsp", O_RDWR);
+        if (m_master_pmem_fd < 0) {
+            m_master_pmem_fd = open("/dev/pmem", O_RDWR);
+        }
+        if (m_master_pmem_fd < 0) {
+            disk_log("Failed to open /dev/pmem_adsp and /dev/pmem: %s", strerror(errno));
+            return -ENOMEM;
+        }
+
+        m_master_base = mmap(NULL, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_master_pmem_fd, 0);
+        if (m_master_base == MAP_FAILED) {
+            disk_log("mmap failed on master pmem fd %d (size=%zu): %s", m_master_pmem_fd, total_size, strerror(errno));
+            close(m_master_pmem_fd);
+            m_master_pmem_fd = -1;
+            m_master_base = NULL;
+            return -ENOMEM;
+        }
+        m_master_size = total_size;
+
+        m_preview_heap = new MemoryHeapBase(m_master_pmem_fd, total_size, 0, 0);
+        disk_log("Allocated master PMEM fd=%d, total_size=%zu, base=%p, heap=%p",
+                 m_master_pmem_fd, total_size, m_master_base, m_preview_heap.get());
+
+        for (int i = 0; i < count; i++) {
+            private_handle_t* hnd = new private_handle_t(
+                m_master_pmem_fd, frame_size,
+                private_handle_t::PRIV_FLAGS_USES_PMEM | private_handle_t::PRIV_FLAGS_USES_PMEM_ADSP
+            );
+            hnd->offset = i * frame_size;
+            hnd->base = (int)((char*)m_master_base + i * frame_size);
+
+            m_buffers[i].handle = hnd;
+            m_buffers[i].pmem_fd = m_master_pmem_fd;
+            m_buffers[i].base = (char*)m_master_base + i * frame_size;
+            m_buffers[i].size = frame_size;
+            m_buffers[i].offset = i * frame_size;
+            m_buffers[i].mem = new MemoryBase(m_preview_heap, i * frame_size, frame_size);
+            m_buffers[i].queued = true;
+
+            g_shim_buffers[i].base = m_buffers[i].base;
+            g_shim_buffers[i].fd = m_buffers[i].pmem_fd;
+            g_shim_buffers[i].size = m_buffers[i].size;
+            g_shim_buffers[i].offset = m_buffers[i].offset;
+
+            /* Pre-fill buffer with neutral gray YUV420sp (Y=128, UV=128) */
+            size_t y_sz = (m_preview_w > 0 && m_preview_h > 0) ? (m_preview_w * m_preview_h) : (640 * 480);
+            size_t uv_sz = y_sz / 2;
+            char* p = (char*)m_buffers[i].base;
+            memset(p, 128, y_sz);
+            memset(p + y_sz, 128, uv_sz);
+
+            disk_log("Preview buffer %d: handle=%p, offset=%zu, base=%p, mem=%p",
+                     i, hnd, m_buffers[i].offset, m_buffers[i].base, m_buffers[i].mem.get());
+        }
+        g_shim_buffer_count = count;
+        return 0;
+    }
+
+    int handle_dequeue_buffer(buffer_handle_t** buffer, int* stride) {
+        for (int i = 0; i < m_buffer_count; i++) {
+            if (m_buffers[i].queued) {
+                m_buffers[i].queued = false;
+                *buffer = (buffer_handle_t*)&m_buffers[i].handle;
+                if (stride) *stride = m_preview_w > 0 ? m_preview_w : 640;
+                /* dequeue buffer */
+                return 0;
+            }
+        }
+        disk_log("preview_stream_ops::dequeue_buffer: no free buffer! re-using buffer 0");
+        *buffer = (buffer_handle_t*)&m_buffers[0].handle;
+        if (stride) *stride = m_preview_w > 0 ? m_preview_w : 640;
+        return 0;
+    }
+
+    int handle_enqueue_buffer(buffer_handle_t* buffer) {
+        g_enqueue_count++;
+        int idx = -1;
+        for (int i = 0; i < m_buffer_count; i++) {
+            if ((buffer_handle_t*)m_buffers[i].handle == buffer ||
+                (buffer_handle_t*)&m_buffers[i].handle == buffer ||
+                (buffer && *(buffer_handle_t**)buffer == (buffer_handle_t*)m_buffers[i].handle)) {
+                idx = i;
+                m_buffers[i].queued = true;
+                break;
+            }
+        }
+        if ((g_enqueue_count % 30) == 1) {
+            disk_log("preview_stream_ops::enqueue_buffer #%d: idx=%d, mem=%p, cb=%p, user=%p",
+                     g_enqueue_count, idx, idx >= 0 ? m_buffers[idx].mem.get() : NULL, m_data_cb, m_user);
+        }
+        // If handle matching failed, copy from last HAL buffer to buf 0
+        if (idx < 0) {
+            int hal_idx = m_last_hal_buf_idx;
+            if (hal_idx >= 0 && hal_idx < m_buffer_count &&
+                m_buffers[0].base && m_buffers[hal_idx].base &&
+                hal_idx != 0) {
+                size_t sz = m_preview_w * m_preview_h * 3 / 2;
+                if (sz <= m_buffers[0].size && sz <= m_buffers[hal_idx].size) {
+                    memcpy(m_buffers[0].base, m_buffers[hal_idx].base, sz);
+                }
+            }
+            idx = 0;
+        }
+        if (!g_start_preview_in_progress && idx >= 0 && m_data_cb) {
+            m_data_cb(CAMERA_MSG_PREVIEW_FRAME, m_buffers[idx].mem, m_user);
+        }
+        return 0;
+    }
+
+
+
+    int handle_cancel_buffer(buffer_handle_t* buffer) {
+        int idx = -1;
+        for (int i = 0; i < m_buffer_count; i++) {
+            if ((buffer_handle_t*)m_buffers[i].handle == buffer ||
+                (buffer_handle_t*)&m_buffers[i].handle == buffer ||
+                (buffer && *(buffer_handle_t**)buffer == (buffer_handle_t*)m_buffers[i].handle)) {
+                idx = i;
+                m_buffers[i].queued = true;
+                break;
+            }
+        }
+        disk_log("preview_stream_ops::cancel_buffer: idx=%d, buf_arg=%p", idx, buffer);
+        return 0;
+    }
+
+public:
+    void on_frame_delivered(void* frame) {
+        if (g_start_preview_in_progress || g_enqueue_count > 0) {
+            return;
+        }
+        static int s_fallback_frames = 0;
+        s_fallback_frames++;
+        if (s_fallback_frames <= 10 || (s_fallback_frames % 30) == 0) {
+            disk_log("on_frame_delivered fallback #%d: m_buffer_count=%d, m_data_cb=%p",
+                     s_fallback_frames, m_buffer_count, m_data_cb);
+        }
+        if (m_buffer_count > 0 && m_data_cb) {
+            int idx = s_fallback_frames % m_buffer_count;
+            if (frame) {
+                char* src = *(char**)((char*)frame + 16);
+                size_t sz = (m_preview_w * m_preview_h * 3) / 2;
+                if (src && m_buffers[idx].base && sz <= m_buffers[idx].size) {
+                    memcpy(m_buffers[idx].base, src, sz);
+                }
+            }
+            m_data_cb(CAMERA_MSG_PREVIEW_FRAME, m_buffers[idx].mem, m_user);
+        }
+    }
+    QcomCameraAdapter(camera_device_t* dev) : m_dev(dev),
+        m_notify_cb(NULL), m_data_cb(NULL), m_data_cb_ts(NULL), m_user(NULL),
+        m_buffer_count(0), m_preview_w(640), m_preview_h(480), m_preview_format(0),
+        m_master_pmem_fd(-1), m_master_base(NULL), m_master_size(0),
+        m_last_hal_buf_idx(0)
+    {
+        disk_log("QcomCameraAdapter constructor: dev=%p, this=%p", dev, this);
+        g_active_adapter = this;
+        setup_camera_callbacks();
+        memset(m_buffers, 0, sizeof(m_buffers));
+        for (int i = 0; i < MAX_BUFFERS; i++) {
+            m_buffers[i].pmem_fd = -1;
+        }
+
+        memset(&m_stream_ops, 0, sizeof(m_stream_ops));
+        m_stream_ops.adapter = this;
+        m_stream_ops.ops.dequeue_buffer = s_dequeue_buffer;
+        m_stream_ops.ops.enqueue_buffer = s_enqueue_buffer;
+        m_stream_ops.ops.cancel_buffer = s_cancel_buffer;
+        m_stream_ops.ops.set_buffer_count = s_set_buffer_count;
+        m_stream_ops.ops.set_buffers_geometry = s_set_buffers_geometry;
+        m_stream_ops.ops.set_crop = s_set_crop;
+        m_stream_ops.ops.set_usage = s_set_usage;
+        m_stream_ops.ops.set_swap_interval = s_set_swap_interval;
+        m_stream_ops.ops.get_min_undequeued_buffer_count = s_get_min_undequeued_buffer_count;
+        m_stream_ops.ops.lock_buffer = s_lock_buffer;
+    }
+
+    virtual ~QcomCameraAdapter() {
+        disk_log("~QcomCameraAdapter ENTER: m_dev=%p", m_dev);
+        if (g_active_adapter == this) {
+            g_active_adapter = NULL;
+        }
+        if (m_dev) {
+            if (m_dev->common.close) {
+                disk_log("Closing camera_device...");
+                m_dev->common.close(&m_dev->common);
+            }
+            m_dev = NULL;
+        }
+        cleanup_buffers();
+        disk_log("~QcomCameraAdapter EXIT");
+    }
+
+    virtual sp<IMemoryHeap> getPreviewHeap() const {
+        disk_log("QcomCameraAdapter::getPreviewHeap -> %p", m_preview_heap.get());
+        return m_preview_heap;
+    }
+
+    virtual sp<IMemoryHeap> getRawHeap() const {
+        disk_log("QcomCameraAdapter::getRawHeap");
+        return NULL;
+    }
+
+    virtual void setCallbacks(notify_callback notify_cb,
+                              data_callback data_cb,
+                              data_callback_timestamp data_cb_timestamp,
+                              void* user) {
+        disk_log("QcomCameraAdapter::setCallbacks: notify=%p, data=%p, data_ts=%p, user=%p",
+                 notify_cb, data_cb, data_cb_timestamp, user);
+        m_notify_cb = notify_cb;
+        m_data_cb = data_cb;
+        m_data_cb_ts = data_cb_timestamp;
+        m_user = user;
+        disk_log("QcomCameraAdapter::setCallbacks: preserved user=%p", m_user);
+        if (m_dev && m_dev->ops && m_dev->ops->set_callbacks) {
+            m_dev->ops->set_callbacks(m_dev, s_notify_cb, s_data_cb, s_data_cb_ts, s_get_memory, this);
+        }
+    }
+
+    virtual void enableMsgType(int32_t msgType) {
+        disk_log("QcomCameraAdapter::enableMsgType(0x%x)", msgType);
+        if (m_dev && m_dev->ops && m_dev->ops->enable_msg_type) {
+            m_dev->ops->enable_msg_type(m_dev, msgType);
+        }
+    }
+
+    virtual void disableMsgType(int32_t msgType) {
+        disk_log("QcomCameraAdapter::disableMsgType(0x%x)", msgType);
+        if (m_dev && m_dev->ops && m_dev->ops->disable_msg_type) {
+            m_dev->ops->disable_msg_type(m_dev, msgType);
+        }
+    }
+
+    virtual bool msgTypeEnabled(int32_t msgType) {
+        disk_log("QcomCameraAdapter::msgTypeEnabled(0x%x)", msgType);
+        if (m_dev && m_dev->ops && m_dev->ops->msg_type_enabled) {
+            return m_dev->ops->msg_type_enabled(m_dev, msgType) != 0;
+        }
+        return false;
+    }
+
+    virtual status_t startPreview() {
+        disk_log("QcomCameraAdapter::startPreview ENTER");
+        if (!m_dev || !m_dev->ops) return NO_INIT;
+
+        g_start_preview_in_progress = true;
+        g_preview_active = true;
+        g_frame_index = 0;
+        g_enqueue_count = 0;
+        setup_camera_callbacks();
+
+        if (m_dev->ops->set_preview_window) {
+            disk_log("Calling set_preview_window with m_stream_ops.ops=%p...", &m_stream_ops.ops);
+            m_dev->ops->set_preview_window(m_dev, &m_stream_ops.ops);
+        }
+
+        status_t rc = NO_ERROR;
+        if (m_dev->ops->start_preview) {
+            disk_log("Calling m_dev->ops->start_preview...");
+            rc = m_dev->ops->start_preview(m_dev);
+            disk_log("m_dev->ops->start_preview returned rc=%d", rc);
+            if (rc != NO_ERROR) {
+                disk_log("m_dev->ops->start_preview returned %d, masking to NO_ERROR", rc);
+                rc = NO_ERROR;
+            }
+        }
+        g_start_preview_in_progress = false;
+        disk_log("QcomCameraAdapter::startPreview EXIT rc=%d", rc);
+        return rc;
+    }
+
+    virtual void stopPreview() {
+        disk_log("QcomCameraAdapter::stopPreview");
+        g_preview_active = false;
+        if (m_dev && m_dev->ops && m_dev->ops->stop_preview) {
+            m_dev->ops->stop_preview(m_dev);
+        }
+    }
+
+    virtual bool previewEnabled() {
+        disk_log("QcomCameraAdapter::previewEnabled -> %d", g_preview_active ? 1 : 0);
+        return g_preview_active;
+    }
+
+    virtual status_t startRecording() {
+        disk_log("QcomCameraAdapter::startRecording");
+        if (!m_dev || !m_dev->ops || !m_dev->ops->start_recording) return NO_INIT;
+        return m_dev->ops->start_recording(m_dev);
+    }
+
+    virtual void stopRecording() {
+        disk_log("QcomCameraAdapter::stopRecording");
+        if (m_dev && m_dev->ops && m_dev->ops->stop_recording) {
+            m_dev->ops->stop_recording(m_dev);
+        }
+    }
+
+    virtual bool recordingEnabled() {
+        if (!m_dev || !m_dev->ops || !m_dev->ops->recording_enabled) return false;
+        return m_dev->ops->recording_enabled(m_dev) != 0;
+    }
+
+    virtual void releaseRecordingFrame(const sp<IMemory>& mem) {
+        disk_log("QcomCameraAdapter::releaseRecordingFrame");
+    }
+
+    virtual status_t autoFocus() {
+        disk_log("QcomCameraAdapter::autoFocus");
+        if (!m_dev || !m_dev->ops || !m_dev->ops->auto_focus) return NO_INIT;
+        return m_dev->ops->auto_focus(m_dev);
+    }
+
+    virtual status_t cancelAutoFocus() {
+        disk_log("QcomCameraAdapter::cancelAutoFocus");
+        if (!m_dev || !m_dev->ops || !m_dev->ops->cancel_auto_focus) return NO_INIT;
+        return m_dev->ops->cancel_auto_focus(m_dev);
+    }
+
+    virtual status_t takePicture() {
+        disk_log("QcomCameraAdapter::takePicture");
+        if (!m_dev || !m_dev->ops || !m_dev->ops->take_picture) return NO_INIT;
+        return m_dev->ops->take_picture(m_dev);
+    }
+
+    virtual status_t cancelPicture() {
+        disk_log("QcomCameraAdapter::cancelPicture");
+        if (!m_dev || !m_dev->ops || !m_dev->ops->cancel_picture) return NO_INIT;
+        return m_dev->ops->cancel_picture(m_dev);
+    }
+
+    virtual status_t setParameters(const CameraParameters& params) {
+        disk_log("QcomCameraAdapter::setParameters ENTER: prev=%s, pic=%s",
+                 params.get(CameraParameters::KEY_PREVIEW_SIZE),
+                 params.get(CameraParameters::KEY_PICTURE_SIZE));
+        if (!m_dev || !m_dev->ops || !m_dev->ops->set_parameters) return NO_INIT;
+        String8 s = params.flatten();
+        status_t rc = m_dev->ops->set_parameters(m_dev, s.string());
+        disk_log("QcomCameraAdapter::setParameters EXIT rc=%d", rc);
+        if (rc != NO_ERROR) {
+            disk_log("QcomCameraAdapter::setParameters: HAL returned %d, masking to NO_ERROR to prevent app crash", rc);
+            LOGW("QcomCameraAdapter::setParameters: HAL returned %d, masking to NO_ERROR to prevent app crash", rc);
+            return NO_ERROR;
+        }
+        return rc;
+    }
+
+    virtual CameraParameters getParameters() const {
+        disk_log("QcomCameraAdapter::getParameters ENTER");
+        CameraParameters params;
+        if (!m_dev || !m_dev->ops || !m_dev->ops->get_parameters) return params;
+        char* s = m_dev->ops->get_parameters(m_dev);
+        disk_log("QcomCameraAdapter::getParameters: got raw str=%p", s);
+        if (s) {
+            disk_log("QcomCameraAdapter::getParameters: str len=%zu", strlen(s));
+            params.unflatten(String8(s));
+            if (m_dev->ops->put_parameters) {
+                m_dev->ops->put_parameters(m_dev, s);
+            }
+        }
+        if (!params.get("zoom-ratios") || (params.get("zoom-supported") && strcmp(params.get("zoom-supported"), "true") == 0)) {
+            params.set("zoom-supported", "false");
+            params.set("smooth-zoom-supported", "false");
+            params.set("zoom-ratios", "100");
+            params.set("max-zoom", "0");
+            params.set("zoom", "0");
+        }
+        disk_log("QcomCameraAdapter::getParameters EXIT: prev=%s, pic=%s",
+                 params.get(CameraParameters::KEY_PREVIEW_SIZE),
+                 params.get(CameraParameters::KEY_PICTURE_SIZE));
+        return params;
+    }
+
+    virtual status_t sendCommand(int32_t cmd, int32_t arg1, int32_t arg2) {
+        disk_log("QcomCameraAdapter::sendCommand(%d, %d, %d)", cmd, arg1, arg2);
+        if (!m_dev || !m_dev->ops || !m_dev->ops->send_command) return NO_INIT;
+        return m_dev->ops->send_command(m_dev, cmd, arg1, arg2);
+    }
+
+    virtual void release() {
+        disk_log("QcomCameraAdapter::release");
+        if (m_dev && m_dev->ops && m_dev->ops->release) {
+            m_dev->ops->release(m_dev);
+        }
+    }
+
+    virtual status_t dump(int fd, const Vector<String16>& args) const {
+        disk_log("QcomCameraAdapter::dump");
+        if (!m_dev || !m_dev->ops || !m_dev->ops->dump) return NO_INIT;
+        return m_dev->ops->dump(m_dev, fd);
+    }
+};
+
+} // namespace android
+
+static void adapter_deliver_frame(void* frame) {
+    if (g_active_adapter) {
+        g_active_adapter->on_frame_delivered(frame);
+    }
+}
+
+extern "C" {
+
 int HAL_getNumberOfCameras() {
+    disk_log("HAL_getNumberOfCameras ENTER");
     ensure_hal_loaded();
     if (g_num_fn) {
         int n = g_num_fn();
+        disk_log("HAL_getNumberOfCameras: g_num_fn returned %d", n);
+        LOGI("HAL_getNumberOfCameras: g_num_fn returned %d", n);
         if (n > 0) return n;
     }
     return 1;
 }
 
 void HAL_getCameraInfo(int cameraId, struct android::CameraInfo* cameraInfo) {
+    disk_log("HAL_getCameraInfo ENTER: cameraId=%d", cameraId);
     if (cameraInfo) {
         cameraInfo->facing = 0; /* CAMERA_FACING_BACK */
         cameraInfo->orientation = 90;
     }
     ensure_hal_loaded();
     if (g_info_fn && cameraInfo) {
-        struct android::CameraInfo temp;
-        temp.facing = 0;
-        temp.orientation = 90;
-        g_info_fn(cameraId, &temp);
-        if (temp.orientation != 0) {
-            *cameraInfo = temp;
+        /* Qualcomm HAL expects CameraInfo structure to be at least 12 bytes
+         * (facing, orientation, flags). If we pass an 8-byte struct on stack,
+         * Qualcomm HAL writes flags (value 5) into the caller's saved registers
+         * on the stack (r4 = cameraId), corrupting cameraId to 5!
+         * Use a generous 64-byte buffer so Qualcomm HAL never overflows our stack frame! */
+        uint32_t qcom_buf[16] = {0};
+        qcom_buf[0] = 0;
+        qcom_buf[1] = 90;
+        g_info_fn(cameraId, (struct android::CameraInfo*)qcom_buf);
+        cameraInfo->facing = (int)qcom_buf[0];
+        if (qcom_buf[1] != 0) {
+            cameraInfo->orientation = (int)qcom_buf[1];
         }
     }
+    disk_log("HAL_getCameraInfo EXIT: facing=%d, orientation=%d", cameraInfo ? cameraInfo->facing : -1, cameraInfo ? cameraInfo->orientation : -1);
 }
 
 android::sp<android::CameraHardwareInterface> HAL_openCameraHardware(int cameraId) {
+    disk_log("HAL_openCameraHardware ENTER: cameraId=%d", cameraId);
     ensure_hal_loaded();
-    if (g_open_fn) {
-        LOGI("Forwarding HAL_openCameraHardware(%d) to Qualcomm HAL (raw ptr call)", cameraId);
-        android::CameraHardwareInterface* raw_hw = g_open_fn(cameraId);
-        LOGI("Qualcomm HAL returned raw pointer: %p", raw_hw);
-        if (raw_hw) {
-            return android::sp<android::CameraHardwareInterface>(raw_hw);
+    inject_sensor_dimensions();
+    if (g_cam_open_fn && g_hmi) {
+        char name[16];
+        snprintf(name, sizeof(name), "%d", cameraId);
+        camera_device_t* dev = NULL;
+        disk_log("HAL_openCameraHardware: Calling camera_device_open(%p, '%s')...", g_hmi, name);
+        int rc = g_cam_open_fn(g_hmi, name, (hw_device_t**)&dev);
+        disk_log("HAL_openCameraHardware: camera_device_open returned rc=%d, dev=%p", rc, dev);
+        if (rc == 0 && dev) {
+            setup_camera_callbacks();
+            disk_log("HAL_openCameraHardware: Creating QcomCameraAdapter with camera_device_t...");
+            return new android::QcomCameraAdapter(dev);
         }
-        LOGE("Qualcomm HAL returned NULL pointer!");
-        return NULL;
+        disk_log("HAL_openCameraHardware: camera_device_open failed rc=%d!", rc);
     }
-    LOGE("g_open_fn is NULL! Returning empty sp");
     return NULL;
 }
 

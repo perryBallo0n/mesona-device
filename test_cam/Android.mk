@@ -12,6 +12,6 @@ include $(CLEAR_VARS)
 LOCAL_SRC_FILES := test_cam_hw.cpp
 LOCAL_MODULE := test_cam_hw
 LOCAL_MODULE_TAGS := optional
-LOCAL_SHARED_LIBRARIES := libc libutils libui libcamera_client libdl
+LOCAL_SHARED_LIBRARIES := libc libutils libui libcamera_client libcamera libdl libbinder
 LOCAL_C_INCLUDES += frameworks/base/include/camera
 include $(BUILD_EXECUTABLE)
