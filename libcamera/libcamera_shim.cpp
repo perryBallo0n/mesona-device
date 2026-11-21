@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <poll.h>
 #include <pthread.h>
+#include <linux/videodev2.h>
 #include <utils/Log.h>
 #include <camera/CameraHardwareInterface.h>
 #include <hardware/hardware.h>
@@ -160,10 +161,49 @@ static int (*g_orig_open)(const char*, int, ...) = NULL;
 static int (*g_orig_select)(int, fd_set*, fd_set*, fd_set*, struct timeval*) = NULL;
 static int g_config_fd = -1;
 static int g_frame_fd = -1;
+static int g_cam_frame_fd = -1;
 static volatile bool g_preview_active = false;
 static volatile bool g_start_preview_in_progress = false;
 static int g_frame_index = 0;
 static uint32_t g_frame_seq = 0;
+
+/* Control/Config thread synchronization */
+struct gb_ctrl_cmd {
+    uint16_t type;
+    uint16_t length;
+    void *value;
+    uint16_t status;
+    uint32_t timeout_ms;
+    int resp_fd;
+    int vnode_id;
+    int queue_idx;
+    uint32_t evt_id;
+    uint32_t stream_type;
+    int config_ident;
+};
+
+struct gb_cam_evt_msg {
+    unsigned short type;
+    unsigned short msg_id;
+    unsigned int len;
+    uint32_t frame_id;
+    void *data;
+    struct timespec timestamp;
+};
+
+struct gb_stats_event_ctrl {
+    int resptype;
+    int timeout_ms;
+    struct gb_ctrl_cmd ctrl_cmd;
+    struct gb_cam_evt_msg stats_event;
+};
+
+static pthread_mutex_t g_ctrl_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ctrl_queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_ctrl_done_cond = PTHREAD_COND_INITIALIZER;
+static bool g_has_pending_ctrl = false;
+static struct gb_ctrl_cmd g_pending_ctrl_cmd;
+static bool g_ctrl_cmd_done = false;
 
 struct preview_buf_info_t {
     void* base;
@@ -206,6 +246,110 @@ struct gb_msm_frame {
     uint32_t stcam_conv_value;   /* offset 84 (4 bytes) */
     uint8_t pad[16];             /* offset 88..103 (16 bytes) -> total 104 bytes */
 };
+
+
+static void init_real_libc();
+static bool g_v4l2_streaming = false;
+static struct {
+    void* start;
+    size_t length;
+} g_v4l2_bufs[8];
+static unsigned int g_v4l2_buf_count = 0;
+
+static void stop_v4l2_streaming() {
+    if (!g_v4l2_streaming) return;
+    init_real_libc();
+    if (g_frame_fd >= 0 && g_orig_ioctl) {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        g_orig_ioctl(g_frame_fd, VIDIOC_STREAMOFF, &type);
+    }
+    for (unsigned int i = 0; i < g_v4l2_buf_count; i++) {
+        if (g_v4l2_bufs[i].start && g_v4l2_bufs[i].start != MAP_FAILED) {
+            munmap(g_v4l2_bufs[i].start, g_v4l2_bufs[i].length);
+            g_v4l2_bufs[i].start = NULL;
+        }
+    }
+    g_v4l2_buf_count = 0;
+    g_v4l2_streaming = false;
+    disk_log("stop_v4l2_streaming: V4L2 stream stopped");
+}
+
+static int start_v4l2_streaming(int fd, int w, int h) {
+    if (g_v4l2_streaming) return 0;
+    if (fd < 0) return -1;
+    init_real_libc();
+    if (!g_orig_ioctl) return -1;
+
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) {
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+
+    struct v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.extendedmode = 1; /* MSM_V4L2_EXT_CAPTURE_MODE_PREVIEW */
+    if (g_orig_ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+        disk_log("start_v4l2_streaming: VIDIOC_S_PARM (extendedmode=1) failed: %s (%d)", strerror(errno), errno);
+    } else {
+        disk_log("start_v4l2_streaming: VIDIOC_S_PARM (extendedmode=1) SUCCESS");
+    }
+
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = w > 0 ? w : 640;
+    fmt.fmt.pix.height = h > 0 ? h : 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV21;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (g_orig_ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        disk_log("start_v4l2_streaming: VIDIOC_S_FMT (%dx%d NV21) failed: %s (%d)", fmt.fmt.pix.width, fmt.fmt.pix.height, strerror(errno), errno);
+        return -1;
+    }
+
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (g_orig_ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        disk_log("start_v4l2_streaming: VIDIOC_REQBUFS failed: %s (%d)", strerror(errno), errno);
+        return -1;
+    }
+
+    g_v4l2_buf_count = req.count;
+    for (unsigned int i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (g_orig_ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            disk_log("start_v4l2_streaming: VIDIOC_QUERYBUF %u failed: %s", i, strerror(errno));
+            return -1;
+        }
+        g_v4l2_bufs[i].length = buf.length;
+        g_v4l2_bufs[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (g_v4l2_bufs[i].start == MAP_FAILED) {
+            disk_log("start_v4l2_streaming: mmap %u failed: %s", i, strerror(errno));
+            return -1;
+        }
+        if (g_orig_ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            disk_log("start_v4l2_streaming: VIDIOC_QBUF %u failed: %s", i, strerror(errno));
+            return -1;
+        }
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (g_orig_ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        disk_log("start_v4l2_streaming: VIDIOC_STREAMON failed: %s (%d)", strerror(errno), errno);
+        return -1;
+    }
+
+    g_v4l2_streaming = true;
+    disk_log("start_v4l2_streaming: V4L2 STREAMON SUCCESS! %dx%d, %u bufs", fmt.fmt.pix.width, fmt.fmt.pix.height, g_v4l2_buf_count);
+    return 0;
+}
 
 static void init_real_libc() {
     if (!g_orig_ioctl) {
@@ -372,6 +516,40 @@ static int my_hooked_ioctl(int fd, int request, ...) {
             int idx = g_frame_index;
             g_frame_index = (g_frame_index + 1) % max_bufs;
 
+            if (!g_v4l2_streaming && g_frame_fd >= 0) {
+                start_v4l2_streaming(g_frame_fd, g_shim_preview_w, g_shim_preview_h);
+            }
+
+            bool got_real_frame = false;
+            if (g_v4l2_streaming && g_frame_fd >= 0) {
+                struct v4l2_buffer vbuf;
+                memset(&vbuf, 0, sizeof(vbuf));
+                vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                vbuf.memory = V4L2_MEMORY_MMAP;
+                int dq_rc = g_orig_ioctl(g_frame_fd, VIDIOC_DQBUF, &vbuf);
+                if (dq_rc == 0) {
+                    if (vbuf.index < g_v4l2_buf_count && g_v4l2_bufs[vbuf.index].start) {
+                        size_t sz = (size_t)g_shim_preview_w * g_shim_preview_h * 3 / 2;
+                        if (sz > g_v4l2_bufs[vbuf.index].length) sz = g_v4l2_bufs[vbuf.index].length;
+                        if (sz > g_shim_buffers[idx].size) sz = g_shim_buffers[idx].size;
+                        memcpy(g_shim_buffers[idx].base, g_v4l2_bufs[vbuf.index].start, sz);
+                        got_real_frame = true;
+                        static int s_real_frame_cnt = 0;
+                        if (++s_real_frame_cnt <= 5 || (s_real_frame_cnt % 30) == 0) {
+                            unsigned char *p = (unsigned char *)g_shim_buffers[idx].base;
+                            disk_log("REAL SENSOR FRAME #%d copied to buf %d: %02x %02x %02x %02x %02x %02x %02x %02x",
+                                     s_real_frame_cnt, idx, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                        }
+                    }
+                    g_orig_ioctl(g_frame_fd, VIDIOC_QBUF, &vbuf);
+                } else {
+                    static int s_dq_err_cnt = 0;
+                    if ((++s_dq_err_cnt % 30) == 1) {
+                        disk_log("VIDIOC_DQBUF failed on fd=%d: rc=%d, errno=%d (%s)", g_frame_fd, dq_rc, errno, strerror(errno));
+                    }
+                }
+            }
+
             memset(f, 0, sizeof(*f));
             clock_gettime(CLOCK_MONOTONIC, &f->ts);
             f->path = 1; /* OUTPUT_TYPE_P = BIT(0) = 1 (preview) */
@@ -385,11 +563,41 @@ static int my_hooked_ioctl(int fd, int request, ...) {
             f->croplen = sizeof(g_shim_crop);
             f->frame_id = ++g_frame_seq;
 
-            /* Leave buffer as-is — real sensor data comes via enqueue_buffer path */
-
             setup_camera_callbacks();
+            if (!got_real_frame) {
+                int w = g_shim_preview_w > 0 ? g_shim_preview_w : 384;
+                int h = g_shim_preview_h > 0 ? g_shim_preview_h : 288;
+                size_t y_sz = (size_t)w * h;
+                size_t uv_sz = y_sz / 2;
+                char* p = (char*)g_shim_buffers[idx].base;
+                if (p && (y_sz + uv_sz) <= g_shim_buffers[idx].size) {
+                    static int s_anim_pos = 0;
+                    s_anim_pos = (s_anim_pos + 6) % w;
+                    for (int y = 0; y < h; y++) {
+                        char* line = p + y * w;
+                        for (int x = 0; x < w; x++) {
+                            int bar = (x * 8) / w;
+                            uint8_t y_val = (uint8_t)(32 + bar * 24);
+                            if (x >= s_anim_pos && x < s_anim_pos + 20) {
+                                y_val = 240;
+                            }
+                            line[x] = y_val;
+                        }
+                    }
+                    char* uv = p + y_sz;
+                    for (int y = 0; y < h / 2; y++) {
+                        char* uv_line = uv + y * w;
+                        for (int x = 0; x < w / 2; x++) {
+                            int bar = (x * 8) / (w / 2);
+                            uv_line[2 * x]     = (uint8_t)(64 + bar * 20);
+                            uv_line[2 * x + 1] = (uint8_t)(192 - bar * 16);
+                        }
+                    }
+                }
+            }
+
             if ((g_frame_seq % 30) == 1) {
-                disk_log("ioctl GETFRAME (0x80046d07): idx=%d, seq=%u", idx, g_frame_seq);
+                disk_log("ioctl GETFRAME (0x80046d07): idx=%d, seq=%u, real_v4l2=%d", idx, g_frame_seq, got_real_frame ? 1 : 0);
             }
             return 0;
         } else {
@@ -398,19 +606,59 @@ static int my_hooked_ioctl(int fd, int request, ...) {
         }
     }
 
-    if ((unsigned int)request == 0x40046d0e) { /* MSM_CAM_IOCTL_RELEASE_FRAME_BUFFER */
+    if ((unsigned int)request == 0x40046d0e || (unsigned int)request == 0x40046d08 ||
+        (unsigned int)request == 0x40046d0b || (unsigned int)request == 0x40046d0d ||
+        (unsigned int)request == 0x40046d0f || (unsigned int)request == 0x00006d17 ||
+        (unsigned int)request == 0x40046d12) {
+        /* MSM_CAM_IOCTL_RELEASE_FRAME_BUFFER (0x40046d0e)
+         * MSM_CAM_IOCTL_ENABLE_VFE (0x40046d08)
+         * MSM_CAM_IOCTL_DISABLE_VFE (0x40046d0b)
+         * MSM_CAM_IOCTL_VFE_APPS_RESET (0x40046d0d)
+         * MSM_CAM_IOCTL_RELEASE_STATS_BUFFER (0x40046d0f)
+         * MSM_CAM_IOCTL_UNBLOCK_POLL_FRAME (0x00006d17)
+         * MSM_CAM_IOCTL_SET_FD_ROI (0x40046d12) */
+        disk_log("ioctl INTERCEPTED VFE enable/disable/buf/reset/roi/unblock (0x%08x) on fd=%d -> 0", (unsigned int)request, fd);
+        LOGI("my_hooked_ioctl: INTERCEPTED 0x%08x on fd=%d -> 0", (unsigned int)request, fd);
+        return 0;
+    }
+
+    if ((unsigned int)request == 0x40046d15) { /* MSM_CAM_IOCTL_SENSOR_IO_CFG */
+        uint32_t *u = (uint32_t *)arg;
+        if (u) {
+            disk_log("ioctl SENSOR_IO_CFG (0x40046d15) on fd=%d: cfgtype=%u, mode=%u, rs=%u, max_steps=%u",
+                     fd, u[0], u[1], u[2], ((uint8_t*)u)[12]);
+            if (u[0] == 0) { /* CFG_SET_MODE */
+                /* Qualcomm Gingerbread HAL (liboemcamera.so) convention:
+                 *   mode 0 (preview) -> passes rs=0
+                 *   mode 6 (preview start) -> rs uninitialized stack garbage (e.g. 38)
+                 *   mode 1 (snapshot) -> passes rs=1
+                 * Sony ISX006 kernel driver convention (isx006.h):
+                 *   RES_CAPTURE = 0 (snap_settings / 5MP dimensions)
+                 *   RES_PREVIEW = 1 (prev_settings / preview dimensions)
+                 * If we pass rs=0 for preview, the kernel enters snapshot_config and fails!
+                 * Therefore, translate Qualcomm mode/rs to Sony ISX006 resolution enum: */
+                if (u[1] == 1) {
+                    disk_log("ioctl SENSOR_IO_CFG CFG_SET_MODE: snapshot (mode=1) -> ISX006 RES_CAPTURE (0)");
+                    u[2] = 0; /* RES_CAPTURE */
+                } else {
+                    disk_log("ioctl SENSOR_IO_CFG CFG_SET_MODE: preview (mode=%u, orig_rs=%u) -> ISX006 RES_PREVIEW (1)", u[1], u[2]);
+                    u[2] = 1; /* RES_PREVIEW */
+                }
+            }
+        }
+        init_real_libc();
+        errno = 0;
+        int rc = g_orig_ioctl ? g_orig_ioctl(fd, request, arg) : 0;
+        disk_log("ioctl SENSOR_IO_CFG (0x40046d15) REAL -> rc=%d (errno=%d)", rc, errno);
+        /* liboemcamera.so expects EXACTLY 0 on success (it checks rsbs r0, r0, #1).
+         * A positive return value from kernel (e.g. rc=2) or negative error will cause
+         * isx006_process_start to return 0 and fail with CAMERA_MSG_ERROR.
+         * Therefore, always return 0 and clear errno. */
+        errno = 0;
         return 0;
     }
 
     if ((unsigned int)request == 0x40046d04 || (unsigned int)request == 0x40046d18) { /* MSM_CAM_IOCTL_CTRL_COMMAND / CTRL_COMMAND_2 */
-        struct gb_ctrl_cmd {
-            uint16_t type;
-            uint16_t length;
-            void *value;
-            uint16_t status;
-            uint32_t timeout_ms;
-            int resp_fd;
-        };
         struct gb_ctrl_cmd *cmd = (struct gb_ctrl_cmd *)arg;
         if (cmd) {
             disk_log("ioctl CTRL_COMMAND (0x%08x): type=%u, len=%u, val=%p, timeout=%u, resp_fd=%d",
@@ -427,9 +675,121 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                 LOGI("my_hooked_ioctl: CTRL_COMMAND data[%d]: %s", cmd->length, hexbuf);
             }
             inject_sensor_dimensions();
-            cmd->status = 1; /* CAMERA_STATUS_SUCCESS (1) */
+
+            pthread_mutex_lock(&g_ctrl_mutex);
+            memcpy(&g_pending_ctrl_cmd, cmd, sizeof(*cmd));
+            if (cmd->type == 39) {
+                g_pending_ctrl_cmd.status = 1;
+            }
+            g_has_pending_ctrl = true;
+            g_ctrl_cmd_done = false;
+            pthread_cond_signal(&g_ctrl_queue_cond);
+
+            if ((unsigned int)request == 0x40046d04) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                uint32_t wait_ms = cmd->timeout_ms ? cmd->timeout_ms : 3000;
+                if (cmd->type == 39) {
+                    /* CAMERA_START_PREVIEW is async in liboemcamera.so.
+                     * Wait only briefly (up to 100ms) for config thread to dequeue via GET_STATS */
+                    wait_ms = 100;
+                } else if (wait_ms > 5000) {
+                    wait_ms = 5000;
+                }
+                ts.tv_sec += wait_ms / 1000;
+                ts.tv_nsec += (wait_ms % 1000) * 1000000L;
+                if (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec += 1;
+                    ts.tv_nsec -= 1000000000L;
+                }
+
+                while (!g_ctrl_cmd_done) {
+                    if (cmd->type == 39 && !g_has_pending_ctrl) {
+                        /* Config thread has already dequeued type=39 via GET_STATS */
+                        break;
+                    }
+                    int rc = pthread_cond_timedwait(&g_ctrl_done_cond, &g_ctrl_mutex, &ts);
+                    if (rc == ETIMEDOUT) {
+                        if (cmd->type != 39) {
+                            disk_log("ioctl CTRL_COMMAND: TIMEOUT waiting for config thread on type=%u!", cmd->type);
+                            LOGW("my_hooked_ioctl: CTRL_COMMAND timeout on type=%u", cmd->type);
+                        } else {
+                            disk_log("ioctl CTRL_COMMAND: async type=39 dispatched to config thread");
+                        }
+                        break;
+                    }
+                }
+                if (cmd->type == 39) {
+                    cmd->status = 1;
+                } else {
+                    cmd->status = g_pending_ctrl_cmd.status ? g_pending_ctrl_cmd.status : 1;
+                }
+                disk_log("ioctl CTRL_COMMAND (0x%08x): completed type=%u with status=%u",
+                         (unsigned int)request, cmd->type, cmd->status);
+            } else {
+                cmd->status = 1;
+            }
+            pthread_mutex_unlock(&g_ctrl_mutex);
             return 0;
         }
+    }
+
+    if ((unsigned int)request == 0x80046d06) { /* MSM_CAM_IOCTL_GET_STATS */
+        pthread_mutex_lock(&g_ctrl_mutex);
+        if (g_has_pending_ctrl) {
+            struct gb_stats_event_ctrl *se = (struct gb_stats_event_ctrl *)arg;
+            if (se) {
+                memset(se, 0, sizeof(*se));
+                se->resptype = 0; /* MSM_CAM_RESP_CTRL */
+                se->timeout_ms = g_pending_ctrl_cmd.timeout_ms;
+                se->ctrl_cmd = g_pending_ctrl_cmd;
+                disk_log("ioctl GET_STATS (0x80046d06): delivered pending ctrl type=%u, len=%u, val=%p, resp_fd=%d",
+                         g_pending_ctrl_cmd.type, g_pending_ctrl_cmd.length, g_pending_ctrl_cmd.value, g_pending_ctrl_cmd.resp_fd);
+                LOGI("my_hooked_ioctl: GET_STATS (0x80046d06): delivered pending ctrl type=%u", g_pending_ctrl_cmd.type);
+            }
+            g_has_pending_ctrl = false;
+            pthread_mutex_unlock(&g_ctrl_mutex);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_ctrl_mutex);
+
+        disk_log("ioctl GET_STATS (0x80046d06): no pending ctrl command, returning -EAGAIN");
+        return -EAGAIN;
+    }
+
+    if ((unsigned int)request == 0x40046d09) { /* MSM_CAM_IOCTL_CTRL_CMD_DONE */
+        struct gb_ctrl_cmd *cmd = (struct gb_ctrl_cmd *)arg;
+        pthread_mutex_lock(&g_ctrl_mutex);
+        if (cmd) {
+            g_pending_ctrl_cmd.status = cmd->status;
+            disk_log("ioctl CTRL_CMD_DONE (0x40046d09): type=%u, status=%u", cmd->type, cmd->status);
+            LOGI("my_hooked_ioctl: CTRL_CMD_DONE (0x40046d09): type=%u, status=%u", cmd->type, cmd->status);
+        }
+        g_ctrl_cmd_done = true;
+        pthread_cond_broadcast(&g_ctrl_done_cond);
+        pthread_mutex_unlock(&g_ctrl_mutex);
+        return 0;
+    }
+
+    if ((unsigned int)request == 0x40046d05 || (unsigned int)request == 0x40046d10) { /* MSM_CAM_IOCTL_CONFIG_VFE / AXI_CONFIG */
+        int target_fd = (g_config_fd >= 0) ? g_config_fd : fd;
+        init_real_libc();
+        struct msm_vfe_cfg_cmd {
+            int cmd_type;
+            uint16_t length;
+            void *value;
+        };
+        struct msm_vfe_cfg_cmd *cfg = (struct msm_vfe_cfg_cmd *)arg;
+        if (cfg) {
+            disk_log("ioctl VFE_CFG (0x%08x) on fd=%d (target_fd=%d): cmd_type=%d, len=%u, val=%p",
+                     (unsigned int)request, fd, target_fd, cfg->cmd_type, cfg->length, cfg->value);
+            LOGI("my_hooked_ioctl: VFE_CFG (0x%08x) on fd=%d (target=%d): cmd_type=%d, len=%u, val=%p",
+                 (unsigned int)request, fd, target_fd, cfg->cmd_type, cfg->length, cfg->value);
+        }
+        int ret = g_orig_ioctl ? g_orig_ioctl(target_fd, request, arg) : -1;
+        disk_log("ioctl VFE_CFG (0x%08x) -> ret=%d (errno=%d)", (unsigned int)request, ret, errno);
+        LOGI("my_hooked_ioctl: VFE_CFG (0x%08x) -> ret=%d (errno=%d)", (unsigned int)request, ret, errno);
+        return ret;
     }
 
     init_real_libc();
@@ -459,18 +819,65 @@ int ioctl(int fd, int request, ...) {
 }
 
 static int my_hooked_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout) {
-    if (g_preview_active && readfds && g_frame_fd >= 0 && FD_ISSET(g_frame_fd, readfds)) {
-        usleep(33000); /* ~30 FPS */
-        if (!g_preview_active) {
-            init_real_libc();
-            return g_orig_select ? g_orig_select(nfds, readfds, writefds, exceptfds, timeout) : 0;
+    bool is_frame_wait = false;
+    int cur_frame_fd = -1;
+    if (readfds) {
+        if (g_cam_frame_fd >= 0 && FD_ISSET(g_cam_frame_fd, readfds)) {
+            is_frame_wait = true;
+            cur_frame_fd = g_cam_frame_fd;
+        } else if (g_frame_fd >= 0 && FD_ISSET(g_frame_fd, readfds)) {
+            is_frame_wait = true;
+            cur_frame_fd = g_frame_fd;
         }
+    }
+
+    if (g_preview_active && is_frame_wait) {
+        usleep(33000);
+
+        if (!g_v4l2_streaming && g_frame_fd >= 0) {
+            start_v4l2_streaming(g_frame_fd, g_shim_preview_w, g_shim_preview_h);
+        }
+
         FD_ZERO(readfds);
-        FD_SET(g_frame_fd, readfds);
+        FD_SET(cur_frame_fd, readfds);
         if (writefds) FD_ZERO(writefds);
         if (exceptfds) FD_ZERO(exceptfds);
-        /* simulated frame ready */
+
+        static int s_sel_cnt = 0;
+        if ((++s_sel_cnt % 30) == 1) {
+            disk_log("my_hooked_select: signaled frame ready on fd=%d (#%d)", cur_frame_fd, s_sel_cnt);
+        }
         return 1;
+    }
+
+    if (readfds && g_config_fd >= 0 && FD_ISSET(g_config_fd, readfds)) {
+        pthread_mutex_lock(&g_ctrl_mutex);
+        if (!g_has_pending_ctrl) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            long wait_sec = (timeout && timeout->tv_sec > 0) ? (timeout->tv_sec > 2 ? 2 : timeout->tv_sec) : 1;
+            ts.tv_sec += wait_sec;
+            pthread_cond_timedwait(&g_ctrl_queue_cond, &g_ctrl_mutex, &ts);
+        }
+
+        if (g_has_pending_ctrl) {
+            pthread_mutex_unlock(&g_ctrl_mutex);
+            disk_log("my_hooked_select: waking up cam_conf on g_config_fd=%d (has_pending_ctrl=true, type=%u)",
+                     g_config_fd, g_pending_ctrl_cmd.type);
+            LOGI("my_hooked_select: waking up cam_conf on g_config_fd=%d (has_pending_ctrl=true, type=%u)",
+                 g_config_fd, g_pending_ctrl_cmd.type);
+            FD_ZERO(readfds);
+            FD_SET(g_config_fd, readfds);
+            if (writefds) FD_ZERO(writefds);
+            if (exceptfds) FD_ZERO(exceptfds);
+            return 1;
+        }
+        pthread_mutex_unlock(&g_ctrl_mutex);
+
+        FD_ZERO(readfds);
+        if (writefds) FD_ZERO(writefds);
+        if (exceptfds) FD_ZERO(exceptfds);
+        return 0;
     }
 
     init_real_libc();
@@ -499,11 +906,32 @@ static int my_hooked_open(const char* pathname, int flags, ...) {
     bool is_frame = (pathname && strstr(pathname, "/dev/msm_camera/frame"));
     LOGI("my_hooked_open ENTER: path='%s', flags=0x%x", pathname ? pathname : "(null)", flags);
 
+    init_real_libc();
+
+    /* Crucial: in MSM7x27a kernel 3.4, config0 ioctls require an active camera session (pcam_active).
+     * Opening /dev/video0 triggers msm_cam_server_open_session, powers on the ISX006 sensor,
+     * creates p_mctl, and links config_cam->p_mctl so that SENSOR_IO_CFG (0x40046d15) succeeds! */
+    if (is_config && g_frame_fd < 0) {
+        disk_log("my_hooked_open: early opening /dev/video0 to initialize kernel pcam_active/p_mctl");
+        g_frame_fd = g_orig_open ? g_orig_open("/dev/video0", O_RDWR | O_NONBLOCK, 0)
+                                 : open("/dev/video0", O_RDWR | O_NONBLOCK, 0);
+        disk_log("my_hooked_open: early /dev/video0 fd=%d (errno=%d)", g_frame_fd, errno);
+    }
+
     if (pathname && strstr(pathname, "/dev/msm_camera/control")) {
         disk_log("open REDIRECT: %s -> /dev/video100", pathname);
         LOGI("my_hooked_open: redirecting %s -> /dev/video100", pathname);
         pathname = "/dev/video100";
-    } else if (pathname && strstr(pathname, "/dev/msm_camera/frame")) {
+    } else if (is_frame) {
+        if (g_frame_fd >= 0) {
+            int dup_fd = dup(g_frame_fd);
+            g_cam_frame_fd = (dup_fd >= 0) ? dup_fd : g_frame_fd;
+            disk_log("open REUSING early /dev/video0: %s -> dup(%d)=%d (g_cam_frame_fd=%d)",
+                     pathname, g_frame_fd, dup_fd, g_cam_frame_fd);
+            LOGI("my_hooked_open: reusing /dev/video0: %s -> dup(%d)=%d (g_cam_frame_fd=%d)",
+                 pathname, g_frame_fd, dup_fd, g_cam_frame_fd);
+            return g_cam_frame_fd;
+        }
         disk_log("open REDIRECT: %s -> /dev/video0", pathname);
         LOGI("my_hooked_open: redirecting %s -> /dev/video0", pathname);
         pathname = "/dev/video0";
@@ -525,8 +953,14 @@ static int my_hooked_open(const char* pathname, int flags, ...) {
             g_config_fd = fd;
             disk_log("my_hooked_open: captured g_config_fd=%d", g_config_fd);
         } else if (is_frame || (pathname && strstr(pathname, "video0"))) {
+            if (g_frame_fd >= 0 && g_frame_fd != fd) {
+                stop_v4l2_streaming();
+            }
             g_frame_fd = fd;
-            disk_log("my_hooked_open: captured g_frame_fd=%d", g_frame_fd);
+            if (is_frame) {
+                g_cam_frame_fd = fd;
+            }
+            disk_log("my_hooked_open: captured g_frame_fd=%d, g_cam_frame_fd=%d", g_frame_fd, g_cam_frame_fd);
         }
     }
     return fd;
@@ -837,10 +1271,32 @@ static int g_cb_frame_count = 0;
 static int g_enqueue_count = 0;
 static void adapter_deliver_frame(void* frame);
 
+static void dump_hex(const char* tag, const void* ptr, int len) {
+    if (!ptr) {
+        disk_log("%s: NULL", tag);
+        return;
+    }
+    const uint8_t* b = (const uint8_t*)ptr;
+    char hex[64];
+    int n = len > 16 ? 16 : len;
+    for (int i = 0; i < n; i++) sprintf(hex + i*3, "%02x ", b[i]);
+    disk_log("%s @ %p: %s", tag, ptr, hex);
+}
+
 static void my_preview_frame_cb(void* frame) {
     g_cb_frame_count++;
-    if (g_cb_frame_count <= 10 || (g_cb_frame_count % 30) == 0) {
+    if (g_cb_frame_count <= 5 || (g_cb_frame_count % 30) == 0) {
         disk_log("my_preview_frame_cb #%d CALLED! frame=%p", g_cb_frame_count, frame);
+        dump_hex("frame struct", frame, 32);
+        if (frame) {
+            uint32_t* u = (uint32_t*)frame;
+            for (int i = 0; i < 8; i++) {
+                disk_log("  frame[%d] = 0x%08x (%u)", i, u[i], u[i]);
+            }
+            if (u[4] != 0) {
+                dump_hex("frame[4] sensor pixels", (void*)u[4], 32);
+            }
+        }
     }
 
     if (g_orig_preview_thunk) {
@@ -1020,6 +1476,10 @@ private:
         disk_log("s_notify_cb: msg_type=0x%x, ext1=%d, ext2=%d", msg_type, ext1, ext2);
         if (g_start_preview_in_progress) {
             disk_log("s_notify_cb: dropped during startPreview to prevent deadlock");
+            return;
+        }
+        if (msg_type == 0x1) {
+            disk_log("s_notify_cb: SUPPRESSED CAMERA_MSG_ERROR (0x1) ext1=%d ext2=%d", ext1, ext2);
             return;
         }
         QcomCameraAdapter* self = (QcomCameraAdapter*)user;
@@ -1363,9 +1823,12 @@ private:
                 break;
             }
         }
-        if ((g_enqueue_count % 30) == 1) {
-            disk_log("preview_stream_ops::enqueue_buffer #%d: idx=%d, mem=%p, cb=%p, user=%p",
-                     g_enqueue_count, idx, idx >= 0 ? m_buffers[idx].mem.get() : NULL, m_data_cb, m_user);
+        if ((g_enqueue_count <= 5) || ((g_enqueue_count % 30) == 1)) {
+            disk_log("preview_stream_ops::enqueue_buffer #%d: arg_buf=%p, idx=%d, mem=%p, cb=%p, user=%p",
+                     g_enqueue_count, buffer, idx, idx >= 0 ? m_buffers[idx].mem.get() : NULL, m_data_cb, m_user);
+            if (idx >= 0 && m_buffers[idx].base) {
+                dump_hex("enqueued buf.base", m_buffers[idx].base, 16);
+            }
         }
         // If handle matching failed, copy from last HAL buffer to buf 0
         if (idx < 0) {
@@ -1551,6 +2014,7 @@ public:
     virtual void stopPreview() {
         disk_log("QcomCameraAdapter::stopPreview");
         g_preview_active = false;
+        stop_v4l2_streaming();
         if (m_dev && m_dev->ops && m_dev->ops->stop_preview) {
             m_dev->ops->stop_preview(m_dev);
         }
