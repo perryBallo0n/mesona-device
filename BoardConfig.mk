@@ -5,12 +5,12 @@ TARGET_NO_BOOTLOADER := true
 TARGET_NO_RADIOIMAGE := true
 # Architecture
 TARGET_ARCH := arm
-TARGET_ARCH_VARIANT := armv7-a
+TARGET_ARCH_VARIANT := armv7-a-neon
 TARGET_CPU_ABI := armeabi-v7a
 TARGET_CPU_ABI2 := armeabi
 TARGET_CPU_VARIANT := cortex-a5
 ARCH_ARM_HAVE_TLS_REGISTER := true
-ARCH_ARM_HAVE_NEON := false
+ARCH_ARM_HAVE_NEON := true
 ARCH_ARM_HAVE_VFP := true
 # Kernel
 # TODO: Update paths after kernel is cloned
@@ -46,9 +46,8 @@ BOARD_VENDOR_QCOM_GPS_LOC_API_HARDWARE := msm7x27a
 BOARD_USES_LEGACY_RIL := true
 # Recovery
 TARGET_RECOVERY_FSTAB := device/sony/mesona/recovery.fstab
-# Filesystem / Partitions — PLACEHOLDER, WILL BE UPDATED
-# >>> NEED REAL VALUES FROM: adb shell cat /proc/partitions <<<
-BOARD_BOOTIMAGE_PARTITION_SIZE := 8388608
+# Filesystem / Partitions (verified against /proc/partitions)
+BOARD_BOOTIMAGE_PARTITION_SIZE := 20971520
 BOARD_SYSTEMIMAGE_PARTITION_SIZE := 681574400
 BOARD_USERDATAIMAGE_PARTITION_SIZE := 803209216
 BOARD_CACHEIMAGE_PARTITION_SIZE := 167772160
@@ -57,3 +56,12 @@ TARGET_PREBUILT_KERNEL := device/sony/mesona/kernel
 TARGET_PROVIDES_LIBAUDIO := true
 USE_CAMERA_STUB := false
 TARGET_USERIMAGES_USE_EXT4 := true
+
+# Recovery
+TARGET_RECOVERY_UI_LIB := librecovery_ui_mesona
+BOARD_RECOVERYIMAGE_PARTITION_SIZE := 8388608
+BOARD_USES_DUALBOOT_RECOVERY := true
+TARGET_RECOVERY_PREBUILT_BUSYBOX := device/sony/mesona/prebuilt/busybox-recovery
+
+# Sony S1Boot ELF format on /dev/block/mmcblk0p3
+BOARD_USES_SONY_ELF_BOOTIMG := true

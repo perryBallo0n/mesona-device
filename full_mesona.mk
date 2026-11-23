@@ -81,3 +81,7 @@ PRODUCT_PACKAGES +=     sensors.msm7x27a
 PRODUCT_PACKAGES +=     gps.msm7x27a     librpc
 
 PRODUCT_COPY_FILES +=     device/common/gps/gps.conf_US_SUPL:system/etc/gps.conf
+
+# Root & Superuser
+PRODUCT_PACKAGES += su Superuser
+PRODUCT_PACKAGES += bootrec

@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <linux/videodev2.h>
 #include <utils/Log.h>
+#include <cutils/properties.h>
 #include <camera/CameraHardwareInterface.h>
 #include <hardware/hardware.h>
 #include <binder/MemoryBase.h>
@@ -233,12 +234,19 @@ const char _ZN7android16CameraParameters8ISO_AUTOE[] = "auto";
 /* ========================================================================= */
 
 static void disk_log(const char* fmt, ...) {
+    static int s_file_log = -1;
+    if (s_file_log < 0) {
+        char prop[PROPERTY_VALUE_MAX] = {0};
+        property_get("persist.camera.shim.log", prop, "0");
+        s_file_log = (prop[0] == '1') ? 1 : 0;
+    }
     va_list ap;
     va_start(ap, fmt);
     char buf[512];
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     LOGI("%s", buf);
+    if (!s_file_log) return;
     FILE* fp = fopen("/data/local/tmp/shim.log", "a");
     if (fp) {
         fputs(buf, fp);

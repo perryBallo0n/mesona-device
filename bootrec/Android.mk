@@ -1,0 +1,12 @@
+LOCAL_PATH := $(call my-dir)
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES := bootrec.c
+LOCAL_MODULE := bootrec
+LOCAL_MODULE_TAGS := optional
+LOCAL_FORCE_STATIC_EXECUTABLE := true
+LOCAL_STATIC_LIBRARIES := libz libc
+LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT)/sbin
+
+LOCAL_C_INCLUDES += external/zlib
+include $(BUILD_EXECUTABLE)
