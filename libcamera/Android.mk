@@ -27,10 +27,12 @@ LOCAL_SHARED_LIBRARIES := \
     liblog \
     libdl \
     libgenlock \
-    libbinder
+    libbinder \
+    libjpeg
 
 LOCAL_C_INCLUDES += \
     frameworks/base/include/camera \
-    hardware/msm7k/libgralloc-qsd8k
+    hardware/msm7k/libgralloc-qsd8k \
+    external/jpeg
 
 include $(BUILD_SHARED_LIBRARY)
