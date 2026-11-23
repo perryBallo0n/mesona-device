@@ -371,7 +371,20 @@ static uint8_t g_last_sensor_frame[1280 * 960 * 3 / 2];
 static volatile bool g_has_sensor_frame = false;
 static int g_sensor_frame_w = 640;
 static int g_sensor_frame_h = 480;
+static int64_t g_last_sensor_frame_ts_ns = 0;
+static int64_t g_last_frame_done_ns = 0;
 static pthread_mutex_t g_sensor_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint8_t* g_cached_stage_bufs[8] = {0};
+static size_t g_cached_stage_sizes[8] = {0};
+static int64_t g_cached_stage_ts_ns[8] = {0};
+static volatile int g_last_stage_idx = 0;
+
+static int64_t now_monotonic_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 
 static const int V4L2_CAP_BUF_COUNT = 4;
 static int g_v4l2_cap_fd = -1;
@@ -1053,16 +1066,28 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                                 };
                                 g_orig_ioctl(g_v4l2_cap_fd, 0x4004700d /* PMEM_INV_CACHES */, &pm);
                             }
+                            int64_t dq_ts_ns = now_monotonic_ns();
+                            size_t out_bytes = (size_t)g_shim_preview_w * g_shim_preview_h * 3 / 2;
+                            uint8_t* stage_dst = (g_cached_stage_bufs[idx] && g_cached_stage_sizes[idx] >= out_bytes)
+                                                 ? g_cached_stage_bufs[idx]
+                                                 : (uint8_t*)g_shim_buffers[idx].base;
                             pthread_mutex_lock(&g_sensor_frame_mutex);
                             memcpy(g_last_sensor_frame, g_v4l2_cap_bufs[cidx].base, frame_bytes);
                             g_sensor_frame_w = g_v4l2_preview_w;
                             g_sensor_frame_h = g_v4l2_preview_h;
+                            g_last_sensor_frame_ts_ns = dq_ts_ns;
                             g_has_sensor_frame = true;
-                            if (g_shim_buffers[idx].base) {
+                            if (stage_dst) {
                                 scale_nv21((const uint8_t*)g_last_sensor_frame, g_v4l2_preview_w, g_v4l2_preview_h,
-                                           (uint8_t*)g_shim_buffers[idx].base, g_shim_preview_w, g_shim_preview_h);
+                                           stage_dst, g_shim_preview_w, g_shim_preview_h);
+                                g_cached_stage_ts_ns[idx] = dq_ts_ns;
+                                g_last_stage_idx = idx;
                             }
                             pthread_mutex_unlock(&g_sensor_frame_mutex);
+                            if (stage_dst && stage_dst != (uint8_t*)g_shim_buffers[idx].base &&
+                                g_shim_buffers[idx].base && g_shim_buffers[idx].size >= out_bytes) {
+                                memcpy(g_shim_buffers[idx].base, stage_dst, out_bytes);
+                            }
                             got_real_frame = true;
                         }
                         if (cidx < (unsigned int)V4L2_CAP_BUF_COUNT && g_v4l2_cap_fd >= 0) {
@@ -1072,16 +1097,28 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                         }
                     } else if (g_v4l2_memory_type == V4L2_MEMORY_MMAP) {
                         if (vbuf.index < g_v4l2_buf_count && g_v4l2_bufs[vbuf.index].start) {
+                            int64_t dq_ts_ns = now_monotonic_ns();
+                            size_t out_bytes = (size_t)g_shim_preview_w * g_shim_preview_h * 3 / 2;
+                            uint8_t* stage_dst = (g_cached_stage_bufs[idx] && g_cached_stage_sizes[idx] >= out_bytes)
+                                                 ? g_cached_stage_bufs[idx]
+                                                 : (uint8_t*)g_shim_buffers[idx].base;
                             pthread_mutex_lock(&g_sensor_frame_mutex);
                             memcpy(g_last_sensor_frame, g_v4l2_bufs[vbuf.index].start, frame_bytes);
                             g_sensor_frame_w = g_v4l2_preview_w;
                             g_sensor_frame_h = g_v4l2_preview_h;
+                            g_last_sensor_frame_ts_ns = dq_ts_ns;
                             g_has_sensor_frame = true;
-                            if (g_shim_buffers[idx].base) {
+                            if (stage_dst) {
                                 scale_nv21((const uint8_t*)g_last_sensor_frame, g_v4l2_preview_w, g_v4l2_preview_h,
-                                           (uint8_t*)g_shim_buffers[idx].base, g_shim_preview_w, g_shim_preview_h);
+                                           stage_dst, g_shim_preview_w, g_shim_preview_h);
+                                g_cached_stage_ts_ns[idx] = dq_ts_ns;
+                                g_last_stage_idx = idx;
                             }
                             pthread_mutex_unlock(&g_sensor_frame_mutex);
+                            if (stage_dst && stage_dst != (uint8_t*)g_shim_buffers[idx].base &&
+                                g_shim_buffers[idx].base && g_shim_buffers[idx].size >= out_bytes) {
+                                memcpy(g_shim_buffers[idx].base, stage_dst, out_bytes);
+                            }
                             got_real_frame = true;
                         }
                     }
@@ -1124,6 +1161,8 @@ static int my_hooked_ioctl(int fd, int request, ...) {
             clock_gettime(CLOCK_MONOTONIC, &f->ts);
             f->path = 1; /* OUTPUT_TYPE_P = BIT(0) = 1 (preview) */
             f->type = 0;
+            /* f->buffer MUST point to the registered PMEM buffer g_shim_buffers[idx].base
+             * so libcamera's g_orig_preview_thunk matches it and invokes enqueue_buffer(). */
             f->buffer = (unsigned long)g_shim_buffers[idx].base;
             f->phy_offset = g_shim_buffers[idx].offset;
             f->y_off = 0;
@@ -1133,14 +1172,27 @@ static int my_hooked_ioctl(int fd, int request, ...) {
             f->croplen = sizeof(g_shim_crop);
             f->frame_id = ++g_frame_seq;
 
-            if (!got_real_frame && g_shim_buffers[idx].base) {
+            if (!got_real_frame) {
+                size_t out_bytes = (size_t)g_shim_preview_w * g_shim_preview_h * 3 / 2;
+                uint8_t* stage_dst = (g_cached_stage_bufs[idx] && g_cached_stage_sizes[idx] >= out_bytes)
+                                     ? g_cached_stage_bufs[idx]
+                                     : (uint8_t*)g_shim_buffers[idx].base;
+                bool copied = false;
                 pthread_mutex_lock(&g_sensor_frame_mutex);
-                if (g_has_sensor_frame) {
+                if (g_has_sensor_frame && stage_dst) {
                     scale_nv21((const uint8_t*)g_last_sensor_frame, g_sensor_frame_w, g_sensor_frame_h,
-                               (uint8_t*)g_shim_buffers[idx].base, g_shim_preview_w, g_shim_preview_h);
+                               stage_dst, g_shim_preview_w, g_shim_preview_h);
+                    g_cached_stage_ts_ns[idx] = g_last_sensor_frame_ts_ns;
+                    g_last_stage_idx = idx;
+                    copied = true;
                 }
                 pthread_mutex_unlock(&g_sensor_frame_mutex);
+                if (copied && stage_dst != (uint8_t*)g_shim_buffers[idx].base &&
+                    g_shim_buffers[idx].base && g_shim_buffers[idx].size >= out_bytes) {
+                    memcpy(g_shim_buffers[idx].base, stage_dst, out_bytes);
+                }
             }
+            g_last_frame_done_ns = now_monotonic_ns();
 
             setup_camera_callbacks();
             static bool s_has_seen_real_frame = false;
@@ -1422,9 +1474,11 @@ static int my_hooked_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set 
             start_v4l2_streaming(g_frame_fd, g_shim_preview_w, g_shim_preview_h);
         }
 
-        /* Note: msm_poll() in kernel skips vb2_poll when pcam_inst->my_index == 0,
-         * so pace at 20ms and let GETFRAME synchronize precisely on VIDIOC_DQBUF. */
-        usleep(20000);
+        /* Smart pacing: avoid adding extra delay if the previous frame cycle already consumed >= 25ms. */
+        int64_t elapsed_us = (now_monotonic_ns() - g_last_frame_done_ns) / 1000LL;
+        if (elapsed_us >= 0 && elapsed_us < 25000) {
+            usleep((useconds_t)(25000 - elapsed_us));
+        }
         FD_ZERO(readfds);
         FD_SET(cur_frame_fd, readfds);
         if (writefds) FD_ZERO(writefds);
@@ -2354,6 +2408,13 @@ private:
 
     void cleanup_buffers() {
         g_shim_buffer_count = 0;
+        for (int i = 0; i < 8; i++) {
+            if (g_cached_stage_bufs[i]) {
+                free(g_cached_stage_bufs[i]);
+                g_cached_stage_bufs[i] = NULL;
+                g_cached_stage_sizes[i] = 0;
+            }
+        }
         m_preview_heap.clear();
         for (int i = 0; i < MAX_BUFFERS; i++) {
             m_buffers[i].mem.clear();
@@ -2435,6 +2496,8 @@ private:
             g_shim_buffers[i].fd = m_buffers[i].pmem_fd;
             g_shim_buffers[i].size = m_buffers[i].size;
             g_shim_buffers[i].offset = m_buffers[i].offset;
+            g_cached_stage_bufs[i] = (uint8_t*)malloc(m_buffers[i].size);
+            g_cached_stage_sizes[i] = g_cached_stage_bufs[i] ? m_buffers[i].size : 0;
 
             /* Pre-fill buffer with neutral gray YUV420sp (Y=128, UV=128) */
             size_t y_sz = (m_preview_w > 0 && m_preview_h > 0) ? (m_preview_w * m_preview_h) : (640 * 480);
@@ -2535,8 +2598,15 @@ private:
                     }
                     pthread_mutex_unlock(&m_rec_lock);
                     if (rec_mem != NULL && rec_dst) {
-                        memcpy(rec_dst, m_buffers[idx].base, sz);
-                        nsecs_t ts_ns = systemTime(SYSTEM_TIME_MONOTONIC);
+                        int st_idx = (idx >= 0 && idx < 8 && g_cached_stage_bufs[idx] && g_cached_stage_sizes[idx] >= sz && g_cached_stage_ts_ns[idx] > 0)
+                                     ? idx : g_last_stage_idx;
+                        const void* rec_src = (st_idx >= 0 && st_idx < 8 && g_cached_stage_bufs[st_idx] && g_cached_stage_sizes[st_idx] >= sz)
+                                              ? (const void*)g_cached_stage_bufs[st_idx]
+                                              : (const void*)m_buffers[idx].base;
+                        nsecs_t ts_ns = (st_idx >= 0 && st_idx < 8 && g_cached_stage_ts_ns[st_idx] > 0)
+                                        ? (nsecs_t)g_cached_stage_ts_ns[st_idx]
+                                        : systemTime(SYSTEM_TIME_MONOTONIC);
+                        memcpy(rec_dst, rec_src, sz);
                         m_data_cb_ts(ts_ns, CAMERA_MSG_VIDEO_FRAME, rec_mem, m_user);
                     }
                 }
