@@ -85,6 +85,7 @@ on property:sys.boot_completed=1
 1 5 0
 1 6 0
 " 
+    start gapps_firstboot
 
 service rmt_storage /system/bin/rmt_storage /dev/block/mmcblk0p12 /dev/block/mmcblk0p13 /dev/block/mmcblk0p14
     user root
@@ -115,4 +116,10 @@ service iprenew_wlan0 /system/bin/dhcpcd -n
 service boot_rainbow /system/bin/boot_rainbow
     user root
     group system
+    oneshot
+
+service gapps_firstboot /system/bin/sh /system/etc/gapps_firstboot.sh
+    user root
+    group root
+    disabled
     oneshot

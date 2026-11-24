@@ -30,6 +30,7 @@ PRODUCT_PACKAGES += \
 
 PRODUCT_COPY_FILES += \
     device/sony/mesona/gapps_gb/framework/com.google.android.maps.jar:system/framework/com.google.android.maps.jar \
+    device/sony/mesona/gapps_gb/etc/gapps_firstboot.sh:system/etc/gapps_firstboot.sh \
     device/sony/mesona/gapps_gb/etc/permissions/android.software.sip.voip.xml:system/etc/permissions/android.software.sip.voip.xml \
     device/sony/mesona/gapps_gb/etc/permissions/com.google.android.maps.xml:system/etc/permissions/com.google.android.maps.xml \
     device/sony/mesona/gapps_gb/etc/permissions/features.xml:system/etc/permissions/features.xml \
