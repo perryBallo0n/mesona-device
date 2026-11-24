@@ -377,11 +377,54 @@ static unsigned int g_v4l2_buf_count = 0;
 
 static uint8_t g_last_sensor_frame[1280 * 960 * 3 / 2];
 static volatile bool g_has_sensor_frame = false;
+static volatile uint32_t g_sensor_frame_seq = 0;
 static int g_sensor_frame_w = 640;
 static int g_sensor_frame_h = 480;
 static int64_t g_last_sensor_frame_ts_ns = 0;
 static int64_t g_last_frame_done_ns = 0;
 static pthread_mutex_t g_sensor_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile bool g_pending_param_apply = false;
+static volatile int g_neg_ev_level = 0;
+static uint8_t g_neg_ev_lut[256];
+static uint8_t g_neg_ev_uv_lut[256];
+
+static void set_neg_ev_level(int ev) {
+    if (ev >= 0) {
+        g_neg_ev_level = 0;
+        return;
+    }
+    if (ev < -6) ev = -6;
+    /* 1/3 stop per step: gain = 2^(ev/3) scaled by 1024 */
+    static const int kGainQ10[7] = { 1024, 813, 645, 512, 406, 323, 256 };
+    int g = kGainQ10[-ev];
+    for (int i = 0; i < 256; i++) {
+        int y_out = 16 + (((i - 16) * g + 512) >> 10);
+        if (y_out < 16) y_out = 16;
+        if (y_out > 235) y_out = 235;
+        g_neg_ev_lut[i] = (uint8_t)y_out;
+
+        int uv_out = 128 + (((i - 128) * g + 512) >> 10);
+        if (uv_out < 16) uv_out = 16;
+        if (uv_out > 240) uv_out = 240;
+        g_neg_ev_uv_lut[i] = (uint8_t)uv_out;
+    }
+    g_neg_ev_level = ev;
+}
+
+static inline void apply_neg_ev_y_plane(uint8_t* nv21, size_t y_count) {
+    if (g_neg_ev_level >= 0 || !nv21) return;
+    const uint8_t* y_lut = g_neg_ev_lut;
+    const uint8_t* uv_lut = g_neg_ev_uv_lut;
+    for (size_t i = 0; i < y_count; i++) {
+        nv21[i] = y_lut[nv21[i]];
+    }
+    uint8_t* uv = nv21 + y_count;
+    size_t uv_count = y_count / 2;
+    for (size_t i = 0; i < uv_count; i++) {
+        uv[i] = uv_lut[uv[i]];
+    }
+}
+static void adapter_on_stream_ready();
 
 static uint8_t* g_cached_stage_bufs[8] = {0};
 static size_t g_cached_stage_sizes[8] = {0};
@@ -462,6 +505,7 @@ static void stop_v4l2_streaming() {
     free_v4l2_cap_pool();
     g_v4l2_buf_count = 0;
     g_v4l2_streaming = false;
+    g_has_sensor_frame = false;
     disk_log("stop_v4l2_streaming: V4L2 stream stopped");
 }
 
@@ -873,6 +917,7 @@ static int start_v4l2_streaming(int fd, int w, int h) {
     s_v4l2_fail_count = 0;
     disk_log("start_v4l2_streaming: V4L2 STREAMON SUCCESS! type=%s, %dx%d, %u bufs",
              use_userptr ? "USERPTR" : "MMAP", g_v4l2_preview_w, g_v4l2_preview_h, g_v4l2_buf_count);
+    adapter_on_stream_ready();
     return 0;
 }
 
@@ -1085,9 +1130,11 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                             g_sensor_frame_h = g_v4l2_preview_h;
                             g_last_sensor_frame_ts_ns = dq_ts_ns;
                             g_has_sensor_frame = true;
+                            g_sensor_frame_seq++;
                             if (stage_dst) {
                                 scale_nv21((const uint8_t*)g_last_sensor_frame, g_v4l2_preview_w, g_v4l2_preview_h,
                                            stage_dst, g_shim_preview_w, g_shim_preview_h);
+                                apply_neg_ev_y_plane(stage_dst, (size_t)g_shim_preview_w * g_shim_preview_h);
                                 g_cached_stage_ts_ns[idx] = dq_ts_ns;
                                 g_last_stage_idx = idx;
                             }
@@ -1116,9 +1163,11 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                             g_sensor_frame_h = g_v4l2_preview_h;
                             g_last_sensor_frame_ts_ns = dq_ts_ns;
                             g_has_sensor_frame = true;
+                            g_sensor_frame_seq++;
                             if (stage_dst) {
                                 scale_nv21((const uint8_t*)g_last_sensor_frame, g_v4l2_preview_w, g_v4l2_preview_h,
                                            stage_dst, g_shim_preview_w, g_shim_preview_h);
+                                apply_neg_ev_y_plane(stage_dst, (size_t)g_shim_preview_w * g_shim_preview_h);
                                 g_cached_stage_ts_ns[idx] = dq_ts_ns;
                                 g_last_stage_idx = idx;
                             }
@@ -1190,6 +1239,7 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                 if (g_has_sensor_frame && stage_dst) {
                     scale_nv21((const uint8_t*)g_last_sensor_frame, g_sensor_frame_w, g_sensor_frame_h,
                                stage_dst, g_shim_preview_w, g_shim_preview_h);
+                    apply_neg_ev_y_plane(stage_dst, (size_t)g_shim_preview_w * g_shim_preview_h);
                     g_cached_stage_ts_ns[idx] = g_last_sensor_frame_ts_ns;
                     g_last_stage_idx = idx;
                     copied = true;
@@ -2137,6 +2187,194 @@ static void ensure_hal_loaded() {
 
 } /* extern "C" */
 
+/* FIH MSM7x27a/ISX006 kernel control ABI (matching kernel headers) */
+#define K_MSM_CAM_IOCTL_SENSOR_IO_CFG    0x40046d15U
+#define K_MSM_CAM_IOCTL_FLASH_CTRL       0x40046d20U
+#define K_MSM_CAM_IOCTL_SENSOR_V4L2_S_CTRL 0x80146d2fU
+
+#define K_V4L2_CID_EXPOSURE              0x00980911U
+#define K_V4L2_CID_WB_TEMP               0x0098091aU
+#define K_V4L2_CID_BESTSHOT_MODE         0x0098092cU
+#define K_V4L2_CID_METER_MODE            0x0098092dU
+#define K_V4L2_CID_FOCUS_ROI             0x0098092eU
+#define K_V4L2_CID_AF                    0x0098092fU
+#define K_V4L2_CID_AF_MODE               0x00980930U
+
+#define K_CFG_GET_FLASH_STATE            47
+#define K_CFG_GET_RC_AF_CHECK            48
+
+enum {
+    K_LED_MODE_OFF = 0,
+    K_LED_MODE_AUTO = 1,
+    K_LED_MODE_ON = 2,
+    K_LED_MODE_TORCH = 3,
+    K_LED_MODE_RED_EYE = 4,
+};
+
+enum {
+    K_LED_STATE_OFF = 0,
+    K_LED_STATE_LOW = 1,
+    K_LED_STATE_HIGH = 2,
+    K_LED_STATE_INIT = 3,
+    K_LED_STATE_RELEASE = 4,
+};
+
+enum {
+    K_AF_ON = 0,
+    K_AF_MACRO = 1,
+    K_AF_SAF = 2,
+    K_AF_CAF = 3,
+    K_AF_INFINITY = 4,
+    K_AF_OFF = 5,
+    K_AF_POLLING = 6,
+    K_AF_GET_STATE = 7,
+};
+
+struct kernel_v4l2_control {
+    uint32_t id;
+    int32_t value;
+    uint16_t focus_roi[6];
+};
+
+struct kernel_flash_ctrl_data {
+    int flashtype;
+    int ledmode;
+    union {
+        int led_state;
+        int raw[2];
+    } ctrl_data;
+};
+
+struct kernel_sensor_cfg_data {
+    int cfgtype;
+    int mode;
+    int rs;
+    uint8_t max_steps;
+    uint8_t pad[3];
+    union {
+        int8_t flash_state;
+        int8_t rc_af_check;
+        uint8_t raw[20];
+    } cfg;
+};
+
+static pthread_mutex_t g_kctrl_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_flash_init_fd = -1;
+
+static int kernel_v4l2_s_ctrl(uint32_t id, int32_t value, const uint16_t* roi6) {
+    if (g_config_fd < 0 || !g_orig_ioctl) return -1;
+    struct kernel_v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    ctrl.id = id;
+    ctrl.value = value;
+    if (roi6) {
+        memcpy(ctrl.focus_roi, roi6, sizeof(ctrl.focus_roi));
+    }
+    pthread_mutex_lock(&g_kctrl_mutex);
+    int fd = g_config_fd;
+    errno = 0;
+    int rc = (fd >= 0) ? g_orig_ioctl(fd, K_MSM_CAM_IOCTL_SENSOR_V4L2_S_CTRL, &ctrl) : -1;
+    int err = errno;
+    pthread_mutex_unlock(&g_kctrl_mutex);
+    if (id != K_V4L2_CID_AF_MODE || value != K_AF_POLLING) {
+        disk_log("kernel_v4l2_s_ctrl(id=0x%08x, val=%d) fd=%d -> rc=%d (errno=%d)",
+                 id, value, fd, rc, err);
+    }
+    return rc;
+}
+
+static int kernel_flash_ctrl_raw(int ledmode, int led_state) {
+    if (g_config_fd < 0 || !g_orig_ioctl) return -1;
+    struct kernel_flash_ctrl_data fi;
+    memset(&fi, 0, sizeof(fi));
+    fi.flashtype = 0; /* MSM_CAMERA_LED_FLASH */
+    fi.ledmode = ledmode;
+    fi.ctrl_data.led_state = led_state;
+    errno = 0;
+    int rc = g_orig_ioctl(g_config_fd, K_MSM_CAM_IOCTL_FLASH_CTRL, &fi);
+    int err = errno;
+    disk_log("kernel_flash_ctrl(mode=%d, state=%d) fd=%d -> rc=%d (errno=%d)",
+             ledmode, led_state, g_config_fd, rc, err);
+    return rc;
+}
+
+static int kernel_flash_ctrl(int ledmode, int led_state) {
+    pthread_mutex_lock(&g_kctrl_mutex);
+    int rc = -1;
+    if (g_config_fd >= 0 && g_orig_ioctl) {
+        if (g_flash_init_fd != g_config_fd && led_state != K_LED_STATE_INIT && led_state != K_LED_STATE_RELEASE) {
+            kernel_flash_ctrl_raw(ledmode, K_LED_STATE_INIT);
+            g_flash_init_fd = g_config_fd;
+        }
+        rc = kernel_flash_ctrl_raw(ledmode, led_state);
+        if (led_state == K_LED_STATE_RELEASE) {
+            g_flash_init_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&g_kctrl_mutex);
+    return rc;
+}
+
+static int kernel_cfg_get_i8(int cfgtype, int8_t* out_val) {
+    if (g_config_fd < 0 || !g_orig_ioctl || !out_val) return -1;
+    struct kernel_sensor_cfg_data cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cfgtype = cfgtype;
+    pthread_mutex_lock(&g_kctrl_mutex);
+    errno = 0;
+    int rc = (g_config_fd >= 0) ? g_orig_ioctl(g_config_fd, K_MSM_CAM_IOCTL_SENSOR_IO_CFG, &cfg) : -1;
+    pthread_mutex_unlock(&g_kctrl_mutex);
+    *out_val = (cfgtype == K_CFG_GET_FLASH_STATE) ? cfg.cfg.flash_state : cfg.cfg.rc_af_check;
+    return rc;
+}
+
+struct StrIntMap {
+    const char* key;
+    int val;
+};
+
+static int map_lookup(const StrIntMap* tbl, size_t n, const char* s, int def_val) {
+    if (!s) return def_val;
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(tbl[i].key, s) == 0) return tbl[i].val;
+    }
+    return def_val;
+}
+
+static const StrIntMap kWbMap[] = {
+    { "auto", 1 },
+    { "incandescent", 3 },
+    { "fluorescent", 4 },
+    { "daylight", 5 },
+    { "cloudy-daylight", 6 },
+};
+
+static const StrIntMap kSceneMap[] = {
+    { "auto", 1 },
+    { "landscape", 2 },
+    { "snow", 3 },
+    { "beach", 4 },
+    { "night", 6 },
+    { "portrait", 7 },
+    { "sports", 9 },
+    { "night-portrait", 15 },
+    { "document", 19 },
+};
+
+static const StrIntMap kFlashMap[] = {
+    { "off", K_LED_MODE_OFF },
+    { "auto", K_LED_MODE_AUTO },
+    { "on", K_LED_MODE_ON },
+    { "torch", K_LED_MODE_TORCH },
+    { "red-eye", K_LED_MODE_RED_EYE },
+};
+
+static const StrIntMap kMeterMap[] = {
+    { "frame-average", 0 },
+    { "center-weighted", 1 },
+    { "spot-metering", 2 },
+};
+
 namespace android {
 
 class QcomCameraAdapter : public CameraHardwareInterface {
@@ -2663,14 +2901,166 @@ public:
             m_data_cb(CAMERA_MSG_PREVIEW_FRAME, m_buffers[idx].mem, m_user);
         }
     }
+    enum FocusModeKind {
+        FOCUS_AUTO = 0,
+        FOCUS_MACRO,
+        FOCUS_INFINITY,
+        FOCUS_CONTINUOUS,
+        FOCUS_FIXED,
+    };
+
+    String8 m_wb_str;
+    String8 m_scene_str;
+    String8 m_flash_str;
+    String8 m_focus_str;
+    String8 m_meter_str;
+    int m_ev_val;
+    int m_led_mode;
+    FocusModeKind m_focus_kind;
+    bool m_has_focus_roi;
+    bool m_roi_dirty;
+    uint16_t m_focus_roi[6];
+    bool m_params_inited;
+    int m_applied_config_fd;
+    int m_applied_wb;
+    int m_applied_ev;
+    int m_applied_scene;
+    int m_applied_meter;
+    int m_applied_led_mode;
+    FocusModeKind m_applied_focus;
+
+    pthread_mutex_t m_af_lock;
+    volatile uint32_t m_af_gen;
+    volatile bool m_af_cancel;
+
+    static FocusModeKind parse_focus_mode(const char* s) {
+        if (!s) return FOCUS_AUTO;
+        if (strcmp(s, "macro") == 0) return FOCUS_MACRO;
+        if (strcmp(s, "infinity") == 0) return FOCUS_INFINITY;
+        if (strcmp(s, "continuous-video") == 0 || strcmp(s, "continuous-picture") == 0) return FOCUS_CONTINUOUS;
+        if (strcmp(s, "fixed") == 0) return FOCUS_FIXED;
+        return FOCUS_AUTO;
+    }
+
+    static bool parse_focus_area(const char* area_str, int prev_w, int prev_h, uint16_t roi[6]) {
+        if (!area_str || area_str[0] == '\0') return false;
+        int l = 0, t = 0, r = 0, b = 0, w = 0;
+        if (sscanf(area_str, " ( %d , %d , %d , %d , %d )", &l, &t, &r, &b, &w) != 5) {
+            return false;
+        }
+        if (w <= 0 || (l == 0 && t == 0 && r == 0 && b == 0)) return false;
+        int cx = (l + r) / 2 + 1000;
+        int cy = (t + b) / 2 + 1000;
+        if (cx < 0) cx = 0; if (cx > 2000) cx = 2000;
+        if (cy < 0) cy = 0; if (cy > 2000) cy = 2000;
+        int ratio = (prev_h > 0) ? (prev_w * 1000 / prev_h) : 1333;
+        roi[0] = (uint16_t)cx;
+        roi[1] = (uint16_t)cy;
+        roi[2] = 0;
+        roi[3] = 0;
+        roi[4] = (uint16_t)ratio;
+        roi[5] = 1;
+        return true;
+    }
+
+    void apply_kernel_parameters(bool force) {
+        if (g_config_fd < 0) return;
+        if (m_applied_config_fd != g_config_fd) {
+            force = true;
+            m_applied_config_fd = g_config_fd;
+            kernel_flash_ctrl(m_led_mode, K_LED_STATE_INIT);
+        }
+
+        int scene = map_lookup(kSceneMap, sizeof(kSceneMap) / sizeof(kSceneMap[0]), m_scene_str.string(), 1);
+        int wb = map_lookup(kWbMap, sizeof(kWbMap) / sizeof(kWbMap[0]), m_wb_str.string(), 1);
+        int meter = map_lookup(kMeterMap, sizeof(kMeterMap) / sizeof(kMeterMap[0]), m_meter_str.string(), 1);
+        int ev = m_ev_val;
+        if (ev < -6) ev = -6;
+        if (ev > 6) ev = 6;
+
+        bool scene_changed = force || (scene != m_applied_scene);
+        if (scene_changed) {
+            kernel_v4l2_s_ctrl(K_V4L2_CID_BESTSHOT_MODE, scene, NULL);
+            m_applied_scene = scene;
+        }
+
+        if (force || wb != m_applied_wb) {
+            kernel_v4l2_s_ctrl(K_V4L2_CID_WB_TEMP, wb, NULL);
+            m_applied_wb = wb;
+        }
+
+        if (force || ev != m_applied_ev) {
+            /* Kernel msm_sensor_write_enum_conf_array truncates enum_val to uint16_t,
+             * breaking negative EVs; use HW EV for >=0 and fast Y-LUT for -6..-1. */
+            kernel_v4l2_s_ctrl(K_V4L2_CID_EXPOSURE, (ev < 0) ? 0 : ev, NULL);
+            set_neg_ev_level(ev);
+            m_applied_ev = ev;
+        }
+
+        if (force || meter != m_applied_meter) {
+            kernel_v4l2_s_ctrl(K_V4L2_CID_METER_MODE, meter, NULL);
+            m_applied_meter = meter;
+        }
+
+        if (force || m_led_mode != m_applied_led_mode) {
+            int led_state = (m_led_mode == K_LED_MODE_TORCH) ? K_LED_STATE_HIGH : K_LED_STATE_OFF;
+            kernel_flash_ctrl(m_led_mode, led_state);
+            m_applied_led_mode = m_led_mode;
+        }
+
+        if (force || m_focus_kind != m_applied_focus) {
+            if (m_focus_kind == FOCUS_MACRO) {
+                kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_MACRO, NULL);
+            } else if (m_focus_kind == FOCUS_INFINITY) {
+                kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_INFINITY, NULL);
+            } else if (m_focus_kind == FOCUS_FIXED) {
+                kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_OFF, NULL);
+            } else if (m_focus_kind == FOCUS_CONTINUOUS) {
+                if (m_applied_focus == FOCUS_MACRO || m_applied_focus == FOCUS_INFINITY) {
+                    kernel_v4l2_s_ctrl(K_V4L2_CID_BESTSHOT_MODE, scene, NULL);
+                }
+                kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_CAF, NULL);
+            } else { /* FOCUS_AUTO */
+                if (!scene_changed && (m_applied_focus == FOCUS_MACRO || m_applied_focus == FOCUS_INFINITY)) {
+                    kernel_v4l2_s_ctrl(K_V4L2_CID_BESTSHOT_MODE, scene, NULL);
+                } else if (m_applied_focus == FOCUS_FIXED || m_applied_focus == FOCUS_CONTINUOUS) {
+                    kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_CAF, NULL);
+                }
+            }
+            m_applied_focus = m_focus_kind;
+        }
+    }
+
     QcomCameraAdapter(camera_device_t* dev) : m_dev(dev),
         m_notify_cb(NULL), m_data_cb(NULL), m_data_cb_ts(NULL), m_user(NULL),
         m_buffer_count(0), m_preview_w(640), m_preview_h(480), m_preview_format(0),
         m_master_pmem_fd(-1), m_master_base(NULL), m_master_size(0),
         m_last_hal_buf_idx(0),
         m_deq_cursor(0),
-        m_recording(false)
+        m_recording(false),
+        m_wb_str("auto"),
+        m_scene_str("auto"),
+        m_flash_str("off"),
+        m_focus_str("auto"),
+        m_meter_str("center-weighted"),
+        m_ev_val(0),
+        m_led_mode(K_LED_MODE_OFF),
+        m_focus_kind(FOCUS_AUTO),
+        m_has_focus_roi(false),
+        m_roi_dirty(false),
+        m_params_inited(false),
+        m_applied_config_fd(-1),
+        m_applied_wb(-999),
+        m_applied_ev(-999),
+        m_applied_scene(-999),
+        m_applied_meter(-999),
+        m_applied_led_mode(-999),
+        m_applied_focus(FOCUS_AUTO),
+        m_af_gen(0),
+        m_af_cancel(false)
     {
+        memset(m_focus_roi, 0, sizeof(m_focus_roi));
+        pthread_mutex_init(&m_af_lock, NULL);
         pthread_mutex_init(&m_rec_lock, NULL);
         for (int i = 0; i < MAX_REC_SLOTS; i++) {
             m_rec_slots[i].base = NULL;
@@ -2724,6 +3114,7 @@ public:
         }
         pthread_mutex_unlock(&m_rec_lock);
         pthread_mutex_destroy(&m_rec_lock);
+        pthread_mutex_destroy(&m_af_lock);
         cleanup_buffers();
         disk_log("~QcomCameraAdapter EXIT");
     }
@@ -2788,6 +3179,9 @@ public:
         if (g_hal_preview_started && g_v4l2_streaming) {
             disk_log("QcomCameraAdapter::startPreview: HAL/V4L2 preview already running, resuming without re-calling set_preview_window");
             g_preview_active = true;
+            if (m_params_inited) {
+                apply_kernel_parameters(false);
+            }
             return NO_ERROR;
         }
 
@@ -2814,6 +3208,13 @@ public:
         }
         g_hal_preview_started = true;
         g_start_preview_in_progress = false;
+        if (m_params_inited) {
+            if (g_v4l2_streaming) {
+                apply_kernel_parameters(true);
+            } else {
+                g_pending_param_apply = true;
+            }
+        }
         disk_log("QcomCameraAdapter::startPreview EXIT rc=%d", rc);
         return rc;
     }
@@ -2869,13 +3270,89 @@ public:
         pthread_mutex_unlock(&m_rec_lock);
     }
 
+    struct AfThreadCtx {
+        QcomCameraAdapter* self;
+        uint32_t gen;
+    };
+
     static void* autofocus_thread_func(void* arg) {
-        QcomCameraAdapter* self = (QcomCameraAdapter*)arg;
+        AfThreadCtx* ctx = (AfThreadCtx*)arg;
+        if (!ctx) return NULL;
+        QcomCameraAdapter* self = ctx->self;
+        uint32_t my_gen = ctx->gen;
+        free(ctx);
         if (!self) return NULL;
-        usleep(30000); // 30ms to allow CameraService::autoFocus to return and release mLock
-        if (self->m_notify_cb) {
-            disk_log("autofocus_thread: notifying CAMERA_MSG_FOCUS success");
-            self->m_notify_cb(CAMERA_MSG_FOCUS, 1, 0, self->m_user);
+
+        usleep(30000); // Allow CameraService::autoFocus to return and release mLock
+        if (self->m_af_cancel || self->m_af_gen != my_gen || g_active_adapter != self) {
+            return NULL;
+        }
+
+        FocusModeKind fmode = self->m_focus_kind;
+        if (fmode == FOCUS_FIXED || fmode == FOCUS_INFINITY || g_config_fd < 0) {
+            if (self->m_notify_cb && !self->m_af_cancel && self->m_af_gen == my_gen) {
+                disk_log("autofocus_thread: fixed/infinity quick success");
+                self->m_notify_cb(CAMERA_MSG_FOCUS, 1, 0, self->m_user);
+            }
+            return NULL;
+        }
+
+        /* Re-apply focus-area ROI if user requested touch AF, or reset center if previously shifted */
+        if (self->m_has_focus_roi) {
+            kernel_v4l2_s_ctrl(K_V4L2_CID_FOCUS_ROI, 1, self->m_focus_roi);
+            self->m_roi_dirty = true;
+        } else if (self->m_roi_dirty) {
+            uint16_t center_roi[6] = { 1000, 1000, 0, 0, 1333, 0 };
+            kernel_v4l2_s_ctrl(K_V4L2_CID_FOCUS_ROI, 0, center_roi);
+            self->m_roi_dirty = false;
+        }
+
+        if (kernel_v4l2_s_ctrl(K_V4L2_CID_AF, K_AF_ON, NULL) < 0) {
+            if (self->m_notify_cb && !self->m_af_cancel && self->m_af_gen == my_gen) {
+                self->m_notify_cb(CAMERA_MSG_FOCUS, 1, 0, self->m_user);
+            }
+            return NULL;
+        }
+
+        bool ready = false;
+        for (int attempt = 0; attempt < 2 && !self->m_af_cancel && self->m_af_gen == my_gen && g_preview_active; attempt++) {
+            int64_t t_start = now_monotonic_ns();
+            ready = false;
+            while (!self->m_af_cancel && self->m_af_gen == my_gen && g_preview_active) {
+                kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_POLLING, NULL);
+                int8_t poll_rc = -1;
+                if (kernel_cfg_get_i8(K_CFG_GET_RC_AF_CHECK, &poll_rc) == 0 && poll_rc == 0) {
+                    ready = true;
+                    break;
+                }
+                if ((now_monotonic_ns() - t_start) > 2500000000LL) {
+                    break;
+                }
+                usleep(20000);
+            }
+            if (self->m_af_cancel || self->m_af_gen != my_gen) break;
+
+            kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_GET_STATE, NULL);
+            int8_t af_state = -1;
+            kernel_cfg_get_i8(K_CFG_GET_RC_AF_CHECK, &af_state);
+            disk_log("autofocus_thread: attempt=%d ready=%d af_state=%d", attempt, ready ? 1 : 0, (int)af_state);
+
+            if (af_state == 2 && attempt == 0) {
+                /* Fine search failed and kernel switched to full-range retry */
+                continue;
+            }
+            int success = (af_state == 0) ? 1 : 0;
+            if (self->m_notify_cb && !self->m_af_cancel && self->m_af_gen == my_gen && g_active_adapter == self) {
+                disk_log("autofocus_thread: notifying CAMERA_MSG_FOCUS success=%d", success);
+                self->m_notify_cb(CAMERA_MSG_FOCUS, success, 0, self->m_user);
+            }
+            return NULL;
+        }
+
+        /* Cancelled or stopped: ensure AF pre-flash torch is turned off */
+        kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_GET_STATE, NULL);
+        if (self->m_led_mode == K_LED_MODE_TORCH) {
+            kernel_flash_ctrl(K_LED_MODE_TORCH, K_LED_STATE_HIGH);
         }
         return NULL;
     }
@@ -2883,8 +3360,50 @@ public:
     static void* snapshot_thread_func(void* arg) {
         QcomCameraAdapter* self = (QcomCameraAdapter*)arg;
         if (!self) return NULL;
-        disk_log("snapshot_thread: started");
+        disk_log("snapshot_thread: started (flash=%s, led_mode=%d, preview_active=%d)",
+                 self->m_flash_str.string(), self->m_led_mode, g_preview_active ? 1 : 0);
         usleep(30000); // 30ms to allow CameraService::takePicture to return and release mLock
+
+        // 0. Fire flash illumination BEFORE stopping preview frame capture
+        bool fire_flash = false;
+        int led_mode = self->m_led_mode;
+        if (g_config_fd >= 0) {
+            if (led_mode == K_LED_MODE_ON || led_mode == K_LED_MODE_RED_EYE) {
+                fire_flash = true;
+            } else if (led_mode == K_LED_MODE_AUTO) {
+                int8_t flash_needed = 0;
+                if (kernel_cfg_get_i8(K_CFG_GET_FLASH_STATE, &flash_needed) == 0 && flash_needed != 0) {
+                    fire_flash = true;
+                }
+                disk_log("snapshot_thread: auto flash check -> flash_needed=%d", (int)flash_needed);
+            }
+        }
+
+        if (fire_flash) {
+            if (led_mode == K_LED_MODE_RED_EYE) {
+                kernel_flash_ctrl(led_mode, K_LED_STATE_HIGH);
+                usleep(100000);
+                kernel_flash_ctrl(led_mode, K_LED_STATE_OFF);
+                usleep(80000);
+            }
+            uint32_t seq0 = g_sensor_frame_seq;
+            kernel_flash_ctrl(led_mode, K_LED_STATE_HIGH);
+            if (g_preview_active) {
+                int64_t t0 = now_monotonic_ns();
+                while ((now_monotonic_ns() - t0) < 350000000LL) {
+                    int64_t dt_ms = (now_monotonic_ns() - t0) / 1000000LL;
+                    if (g_sensor_frame_seq >= seq0 + 2 && dt_ms >= 90) {
+                        break;
+                    }
+                    usleep(10000);
+                }
+                disk_log("snapshot_thread: flash lit seq %u -> %u", seq0, g_sensor_frame_seq);
+            } else {
+                usleep(180000);
+            }
+        }
+
+        g_preview_active = false;
 
         // 1. Shutter sound
         if (self->m_notify_cb) {
@@ -2904,11 +3423,16 @@ public:
             nv21_copy = (uint8_t*)malloc(snap_sz);
             if (nv21_copy) {
                 memcpy(nv21_copy, g_last_sensor_frame, snap_sz);
+                apply_neg_ev_y_plane(nv21_copy, (size_t)w * h);
                 nv21_src = nv21_copy;
             }
             disk_log("snapshot_thread: using real sensor frame (%dx%d)!", w, h);
         }
         pthread_mutex_unlock(&g_sensor_frame_mutex);
+
+        if (fire_flash) {
+            kernel_flash_ctrl(led_mode, (led_mode == K_LED_MODE_TORCH) ? K_LED_STATE_HIGH : K_LED_STATE_OFF);
+        }
         if (!nv21_src) {
             w = self->m_preview_w > 0 ? self->m_preview_w : (g_shim_preview_w > 0 ? g_shim_preview_w : 640);
             h = self->m_preview_h > 0 ? self->m_preview_h : (g_shim_preview_h > 0 ? g_shim_preview_h : 480);
@@ -2959,22 +3483,42 @@ public:
     }
 
     virtual status_t autoFocus() {
-        disk_log("QcomCameraAdapter::autoFocus ENTER (async dispatch only)");
+        disk_log("QcomCameraAdapter::autoFocus ENTER (focus=%s)", m_focus_str.string());
+        pthread_mutex_lock(&m_af_lock);
+        m_af_cancel = false;
+        uint32_t gen = ++m_af_gen;
+        pthread_mutex_unlock(&m_af_lock);
+
+        AfThreadCtx* ctx = (AfThreadCtx*)malloc(sizeof(AfThreadCtx));
+        if (!ctx) return NO_MEMORY;
+        ctx->self = this;
+        ctx->gen = gen;
+
         pthread_t t;
-        pthread_create(&t, NULL, autofocus_thread_func, this);
+        pthread_create(&t, NULL, autofocus_thread_func, ctx);
         pthread_detach(t);
-        // Do not call m_dev->ops->auto_focus(m_dev) synchronously - it deadlocks CameraService binder thread!
         return NO_ERROR;
     }
 
     virtual status_t cancelAutoFocus() {
-        disk_log("QcomCameraAdapter::cancelAutoFocus");
+        disk_log("QcomCameraAdapter::cancelAutoFocus ENTER");
+        pthread_mutex_lock(&m_af_lock);
+        m_af_cancel = true;
+        m_af_gen++;
+        pthread_mutex_unlock(&m_af_lock);
+        if (m_focus_kind == FOCUS_CONTINUOUS && g_config_fd >= 0) {
+            kernel_v4l2_s_ctrl(K_V4L2_CID_AF_MODE, K_AF_CAF, NULL);
+        }
         return NO_ERROR;
     }
 
     virtual status_t takePicture() {
         disk_log("QcomCameraAdapter::takePicture ENTER");
-        g_preview_active = false;
+        pthread_mutex_lock(&m_af_lock);
+        m_af_cancel = true;
+        m_af_gen++;
+        pthread_mutex_unlock(&m_af_lock);
+        /* Keep g_preview_active=true so flash capture inside snapshot_thread_func gets fresh lit frames */
         pthread_t t;
         pthread_create(&t, NULL, snapshot_thread_func, this);
         pthread_detach(t);
@@ -2987,16 +3531,70 @@ public:
     }
 
     virtual status_t setParameters(const CameraParameters& params) {
-        disk_log("QcomCameraAdapter::setParameters ENTER: prev=%s, pic=%s",
+        const char* p_wb    = params.get(CameraParameters::KEY_WHITE_BALANCE);
+        const char* p_scene = params.get(CameraParameters::KEY_SCENE_MODE);
+        const char* p_flash = params.get(CameraParameters::KEY_FLASH_MODE);
+        const char* p_focus = params.get(CameraParameters::KEY_FOCUS_MODE);
+        const char* p_ev    = params.get(CameraParameters::KEY_EXPOSURE_COMPENSATION);
+        const char* p_meter = params.get("auto-exposure");
+        const char* p_areas = params.get("focus-areas");
+
+        disk_log("QcomCameraAdapter::setParameters ENTER: prev=%s pic=%s focus=%s flash=%s wb=%s ev=%s scene=%s",
                  params.get(CameraParameters::KEY_PREVIEW_SIZE),
-                 params.get(CameraParameters::KEY_PICTURE_SIZE));
+                 params.get(CameraParameters::KEY_PICTURE_SIZE),
+                 p_focus ? p_focus : "(null)",
+                 p_flash ? p_flash : "(null)",
+                 p_wb ? p_wb : "(null)",
+                 p_ev ? p_ev : "(null)",
+                 p_scene ? p_scene : "(null)");
         if (!m_dev || !m_dev->ops || !m_dev->ops->set_parameters) return NO_INIT;
+
+        if (p_wb && map_lookup(kWbMap, sizeof(kWbMap)/sizeof(kWbMap[0]), p_wb, -1) >= 0) {
+            m_wb_str = p_wb;
+        }
+        if (p_scene && map_lookup(kSceneMap, sizeof(kSceneMap)/sizeof(kSceneMap[0]), p_scene, -1) >= 0) {
+            m_scene_str = p_scene;
+        }
+        if (p_flash) {
+            int lm = map_lookup(kFlashMap, sizeof(kFlashMap)/sizeof(kFlashMap[0]), p_flash, -1);
+            if (lm >= 0) {
+                m_flash_str = p_flash;
+                m_led_mode = lm;
+            }
+        }
+        if (p_focus) {
+            m_focus_str = p_focus;
+            m_focus_kind = parse_focus_mode(p_focus);
+        }
+        if (p_ev) {
+            int ev = atoi(p_ev);
+            if (ev < -6) ev = -6;
+            if (ev > 6) ev = 6;
+            m_ev_val = ev;
+        }
+        if (p_meter && map_lookup(kMeterMap, sizeof(kMeterMap)/sizeof(kMeterMap[0]), p_meter, -1) >= 0) {
+            m_meter_str = p_meter;
+        }
+        int pw = 640, ph = 480;
+        params.getPreviewSize(&pw, &ph);
+        if (parse_focus_area(p_areas, pw, ph, m_focus_roi)) {
+            m_has_focus_roi = true;
+        } else {
+            m_has_focus_roi = false;
+        }
+        m_params_inited = true;
+
         String8 s = params.flatten();
         status_t rc = m_dev->ops->set_parameters(m_dev, s.string());
-        disk_log("QcomCameraAdapter::setParameters EXIT rc=%d", rc);
+        if (g_v4l2_streaming) {
+            apply_kernel_parameters(false);
+        } else {
+            g_pending_param_apply = true;
+        }
+
+        disk_log("QcomCameraAdapter::setParameters EXIT hal_rc=%d", rc);
         if (rc != NO_ERROR) {
-            disk_log("QcomCameraAdapter::setParameters: HAL returned %d, masking to NO_ERROR to prevent app crash", rc);
-            LOGW("QcomCameraAdapter::setParameters: HAL returned %d, masking to NO_ERROR to prevent app crash", rc);
+            disk_log("QcomCameraAdapter::setParameters: HAL returned %d, masking to NO_ERROR", rc);
             return NO_ERROR;
         }
         return rc;
@@ -3007,9 +3605,7 @@ public:
         CameraParameters params;
         if (!m_dev || !m_dev->ops || !m_dev->ops->get_parameters) return params;
         char* s = m_dev->ops->get_parameters(m_dev);
-        disk_log("QcomCameraAdapter::getParameters: got raw str=%p", s);
         if (s) {
-            disk_log("QcomCameraAdapter::getParameters: str len=%zu", strlen(s));
             params.unflatten(String8(s));
             if (m_dev->ops->put_parameters) {
                 m_dev->ops->put_parameters(m_dev, s);
@@ -3050,9 +3646,46 @@ public:
         if (!val || strlen(val) == 0) {
             params.set(CameraParameters::KEY_SUPPORTED_JPEG_THUMBNAIL_SIZES, "512x288,480x288,432x288,320x240,0x0");
         }
-        disk_log("QcomCameraAdapter::getParameters EXIT: prev=%s, pic=%s",
+
+        /* Advertise and keep synchronized all ISX006 + LM3561 camera controls */
+        params.set(CameraParameters::KEY_SUPPORTED_FLASH_MODES, "off,auto,on,torch,red-eye");
+        params.set(CameraParameters::KEY_FLASH_MODE, m_flash_str.string());
+
+        params.set(CameraParameters::KEY_SUPPORTED_FOCUS_MODES, "auto,macro,infinity,continuous-video,fixed");
+        params.set(CameraParameters::KEY_FOCUS_MODE, m_focus_str.string());
+        if (m_focus_kind == FOCUS_INFINITY) {
+            params.set(CameraParameters::KEY_FOCUS_DISTANCES, "1.50,Infinity,Infinity");
+        } else if (m_focus_kind == FOCUS_MACRO) {
+            params.set(CameraParameters::KEY_FOCUS_DISTANCES, "0.08,0.20,0.60");
+        } else {
+            params.set(CameraParameters::KEY_FOCUS_DISTANCES, "0.10,1.20,Infinity");
+        }
+
+        params.set(CameraParameters::KEY_SUPPORTED_WHITE_BALANCE, "auto,incandescent,fluorescent,daylight,cloudy-daylight");
+        params.set(CameraParameters::KEY_WHITE_BALANCE, m_wb_str.string());
+
+        params.set(CameraParameters::KEY_SUPPORTED_SCENE_MODES, "auto,portrait,landscape,night,night-portrait,beach,snow,sports,document");
+        params.set(CameraParameters::KEY_SCENE_MODE, m_scene_str.string());
+
+        params.set(CameraParameters::KEY_MIN_EXPOSURE_COMPENSATION, "-6");
+        params.set(CameraParameters::KEY_MAX_EXPOSURE_COMPENSATION, "6");
+        /* 0.333334 so floor(6 * step) == 2 in Gingerbread CameraSettings */
+        params.set(CameraParameters::KEY_EXPOSURE_COMPENSATION_STEP, "0.333334");
+        char ev_buf[16];
+        snprintf(ev_buf, sizeof(ev_buf), "%d", m_ev_val);
+        params.set(CameraParameters::KEY_EXPOSURE_COMPENSATION, ev_buf);
+
+        params.set("auto-exposure-values", "frame-average,center-weighted,spot-metering");
+        params.set("auto-exposure", m_meter_str.string());
+
+        disk_log("QcomCameraAdapter::getParameters EXIT: prev=%s pic=%s focus=%s flash=%s wb=%s ev=%s scene=%s",
                  params.get(CameraParameters::KEY_PREVIEW_SIZE),
-                 params.get(CameraParameters::KEY_PICTURE_SIZE));
+                 params.get(CameraParameters::KEY_PICTURE_SIZE),
+                 params.get(CameraParameters::KEY_FOCUS_MODE),
+                 params.get(CameraParameters::KEY_FLASH_MODE),
+                 params.get(CameraParameters::KEY_WHITE_BALANCE),
+                 params.get(CameraParameters::KEY_EXPOSURE_COMPENSATION),
+                 params.get(CameraParameters::KEY_SCENE_MODE));
         return params;
     }
 
@@ -3072,6 +3705,15 @@ public:
 
     virtual void release() {
         disk_log("QcomCameraAdapter::release");
+        pthread_mutex_lock(&m_af_lock);
+        m_af_cancel = true;
+        m_af_gen++;
+        pthread_mutex_unlock(&m_af_lock);
+        set_neg_ev_level(0);
+        if (g_config_fd >= 0) {
+            kernel_flash_ctrl(K_LED_MODE_OFF, K_LED_STATE_OFF);
+            kernel_flash_ctrl(K_LED_MODE_OFF, K_LED_STATE_RELEASE);
+        }
         if (m_dev && m_dev->ops && m_dev->ops->release) {
             m_dev->ops->release(m_dev);
         }
@@ -3089,6 +3731,13 @@ public:
 static void adapter_deliver_frame(void* frame) {
     if (g_active_adapter) {
         g_active_adapter->on_frame_delivered(frame);
+    }
+}
+
+static void adapter_on_stream_ready() {
+    if (g_active_adapter && g_pending_param_apply) {
+        g_pending_param_apply = false;
+        g_active_adapter->apply_kernel_parameters(true);
     }
 }
 
