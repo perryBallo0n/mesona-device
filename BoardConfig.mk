@@ -61,7 +61,7 @@ TARGET_USERIMAGES_USE_EXT4 := true
 TARGET_RECOVERY_UI_LIB := librecovery_ui_mesona
 BOARD_RECOVERYIMAGE_PARTITION_SIZE := 8388608
 BOARD_USES_DUALBOOT_RECOVERY := true
-TARGET_RECOVERY_PREBUILT_BUSYBOX := device/sony/mesona/prebuilt/busybox-recovery
+# CM7 CWM recovery embeds libbusybox; prebuilt busybox-recovery would clobber /sbin/recovery via symlink
 
 # Sony S1Boot ELF format on /dev/block/mmcblk0p3
 BOARD_USES_SONY_ELF_BOOTIMG := true
