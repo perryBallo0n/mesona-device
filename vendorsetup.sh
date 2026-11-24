@@ -1,2 +1,4 @@
 add_lunch_combo full_mesona-eng
 add_lunch_combo full_mesona-userdebug
+add_lunch_combo full_mesona_gapps-eng
+add_lunch_combo full_mesona_gapps-userdebug
