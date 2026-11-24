@@ -1,4 +1,5 @@
 waitForIdleAfterDraw = 0
 waitForIdleOnSubmit = 1
 enableOptimizedVboUpdates = 1
-enableMemoryPool = 0
+useUncachedVBOs = 1
+enableMemoryPool = 1
