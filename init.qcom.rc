@@ -77,8 +77,12 @@ on boot
     write /sys/class/android_usb/android0/enable 1
 
 on property:sys.boot_completed=1
-    # Switch CPU governor from performance to ondemand after boot
+    # Switch CPU governor from performance to tuned ondemand after boot
     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ondemand
+    write /sys/devices/system/cpu/cpufreq/ondemand/up_threshold 80
+    write /sys/devices/system/cpu/cpufreq/ondemand/sampling_rate 30000
+    write /sys/devices/system/cpu/cpufreq/ondemand/sampling_down_factor 2
+    write /sys/devices/system/cpu/cpufreq/ondemand/io_is_busy 1
     # Stop boot rainbow and turn off bottom illumination
     stop boot_rainbow
     write /sys/class/led/fih_led/control "1 4 0
