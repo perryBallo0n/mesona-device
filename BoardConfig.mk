@@ -65,3 +65,5 @@ TARGET_RECOVERY_PREBUILT_BUSYBOX := device/sony/mesona/prebuilt/busybox-recovery
 
 # Sony S1Boot ELF format on /dev/block/mmcblk0p3
 BOARD_USES_SONY_ELF_BOOTIMG := true
+
+BOARD_CUSTOM_BOOTIMG_MK := device/sony/mesona/custombootimg.mk
