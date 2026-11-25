@@ -1,0 +1,22 @@
+commit 35b24a48b066791fa493f5fa040d06b1975a7783
+Author: perryBallo0n <impandainthespace@gmail.com>
+Date:   Tue Nov 24 23:35:15 2026 +0300
+
+    libpng: fix infinite loop in png_read_row on decompression error when index is NULL
+    
+    Change-Id: If5b2a2a0fe2623519a0d4cf2b8f405000a43bc05
+
+diff --git a/pngread.c b/pngread.c
+index d790f44..bc7305d 100644
+--- a/pngread.c
++++ b/pngread.c
+@@ -777,7 +777,8 @@ png_read_row(png_structp png_ptr, png_bytep row, png_bytep dsp_row)
+       }
+       if (ret != Z_OK)
+ #ifdef PNG_INDEX_SUPPORTED
+-         if (png_ptr->index && png_ptr->row_number != png_ptr->height - 1)
++         if (!png_ptr->index || png_ptr->row_number != png_ptr->height - 1 ||
++             png_ptr->zstream.avail_out)
+ #endif
+             png_error(png_ptr, png_ptr->zstream.msg ? png_ptr->zstream.msg :
+                    "Decompression error");

@@ -1,0 +1,122 @@
+diff --git a/adb/services.c b/adb/services.c
+index a4edb44..a84a087 100644
+--- a/adb/services.c
++++ b/adb/services.c
+@@ -191,14 +191,28 @@ void reboot_service(int fd, void *arg)
+     pid = fork();
+     if (pid == 0) {
+         /* ask vdc to unmount it */
+-        execl("/system/bin/vdc", "/system/bin/vdc", "volume", "unmount",
+-                getenv("EXTERNAL_STORAGE"), "force", NULL);
++        const char *ext = getenv("EXTERNAL_STORAGE");
++        if (ext && *ext) {
++            execl("/system/bin/vdc", "/system/bin/vdc", "volume", "unmount",
++                    ext, "force", NULL);
++        }
++        _exit(127);
+     } else if (pid > 0) {
+         /* wait until vdc succeeds or fails */
+         waitpid(pid, &ret, 0);
+     }
+-    ret = __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+-                   LINUX_REBOOT_CMD_RESTART2, (char *)arg);
++    if (arg && strcmp((char *)arg, "recovery") == 0) {
++        adb_mkdir("/cache/recovery", 0770);
++        int fd_boot = adb_creat("/cache/recovery/boot", 0644);
++        if (fd_boot >= 0) adb_close(fd_boot);
++        sync();
++        ret = reboot(RB_AUTOBOOT);
++    } else if (arg && ((char *)arg)[0] != '\0') {
++        ret = __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
++                       LINUX_REBOOT_CMD_RESTART2, (char *)arg);
++    } else {
++        ret = reboot(RB_AUTOBOOT);
++    }
+     if (ret < 0) {
+         snprintf(buf, sizeof(buf), "reboot failed: %s\n", strerror(errno));
+         writex(fd, buf, strlen(buf));
+diff --git a/init/logo.c b/init/logo.c
+index 614224c..13470f5 100644
+--- a/init/logo.c
++++ b/init/logo.c
+@@ -77,7 +77,8 @@ fail:
+ static void fb_close(struct FB *fb)
+ {
+     munmap(fb->bits, fb_size(fb));
+-    close(fb->fd);
++    /* Keep fb->fd open in init so framebuffer remains active */
++    // close(fb->fd);
+ }
+ 
+ /* there's got to be a more portable way to do this ... */
+@@ -87,6 +88,7 @@ static void fb_update(struct FB *fb)
+     ioctl(fb->fd, FBIOPUT_VSCREENINFO, &fb->vi);
+     fb->vi.yoffset = 0;
+     ioctl(fb->fd, FBIOPUT_VSCREENINFO, &fb->vi);
++    ioctl(fb->fd, FBIOPAN_DISPLAY, &fb->vi);
+ }
+ 
+ static int vt_set_mode(int graphics)
+@@ -94,7 +96,7 @@ static int vt_set_mode(int graphics)
+     int fd, r;
+     fd = open("/dev/tty0", O_RDWR | O_SYNC);
+     if (fd < 0)
+-        return -1;
++        return 0;
+     r = ioctl(fd, KDSETMODE, (void*) (graphics ? KD_GRAPHICS : KD_TEXT));
+     close(fd);
+     return r;
+@@ -149,7 +151,7 @@ int load_565rle_image(char *fn)
+     fb_update(&fb);
+     fb_close(&fb);
+     close(fd);
+-    unlink(fn);
++    // unlink(fn);
+     return 0;
+ 
+ fail_unmap_data:
+diff --git a/libreboot/reboot.c b/libreboot/reboot.c
+index 430c57f..2ade4b4 100644
+--- a/libreboot/reboot.c
++++ b/libreboot/reboot.c
+@@ -2,6 +2,10 @@
+ 
+ #include <stdlib.h>
+ #include <sys/reboot.h>
++#include <fcntl.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #ifdef RECOVERY_SHELL
+ #include "../../../bootable/recovery/libcrecovery/common.h"
+@@ -19,6 +23,14 @@ int reboot_wrapper(const char* reason) {
+     if (reason != NULL) {
+         // pass the reason to the kernel when we reboot
+         reboot_with_reason = 1;
++        if (strcmp(reason, "recovery") == 0) {
++            mkdir("/cache/recovery", 0770);
++            int fd = open("/cache/recovery/boot", O_CREAT | O_WRONLY, 0644);
++            if (fd >= 0) close(fd);
++            sync();
++            /* Sony S1 bootloader enters S1Boot Download on RESTART2 "recovery"; normal reboot triggers bootrec */
++            reboot_with_reason = 0;
++        }
+ 
+ #ifdef RECOVERY_PRE_COMMAND
+         if (!strncmp(reason,"recovery",8)) {
+diff --git a/rootdir/ueventd.rc b/rootdir/ueventd.rc
+index 8803737..3b6b3ef 100644
+--- a/rootdir/ueventd.rc
++++ b/rootdir/ueventd.rc
+@@ -16,6 +16,10 @@
+ 
+ # gpu driver for adreno200 is globally accessible
+ /dev/kgsl                 0666   root       root
++/dev/kgsl-3d0             0666   system     graphics
++/dev/kgsl-2d0             0666   system     graphics
++/dev/kgsl-2d1             0666   system     graphics
++/dev/genlock              0666   system     graphics
+ 
+ # these should not be world writable
+ /dev/diag                 0660   radio      radio

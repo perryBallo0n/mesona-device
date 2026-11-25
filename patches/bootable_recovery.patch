@@ -1,0 +1,25 @@
+diff --git a/etc/init.rc b/etc/init.rc
+index c258657..fcfe25b 100644
+--- a/etc/init.rc
++++ b/etc/init.rc
+@@ -11,6 +11,7 @@ on init
+ 
+     mkdir /boot
+     mkdir /sdcard
++    mkdir /external_sd
+     mkdir /sd-ext
+     mkdir /datadata
+     mkdir /emmc
+@@ -25,6 +26,12 @@ on boot
+     hostname localhost
+     domainname localdomain
+ 
++    write /sys/module/msm_fb/parameters/align_buffer 1
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 0fce
++    write /sys/class/android_usb/android0/idProduct 6176
++    write /sys/class/android_usb/android0/functions mass_storage,adb
++    write /sys/class/android_usb/android0/enable 1
+     class_start default
+ 
+ service ueventd /sbin/ueventd

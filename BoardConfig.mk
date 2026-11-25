@@ -59,6 +59,8 @@ TARGET_USERIMAGES_USE_EXT4 := true
 
 # Recovery
 TARGET_RECOVERY_UI_LIB := librecovery_ui_mesona
+BOARD_HAS_NO_SELECT_BUTTON := true
+TARGET_RECOVERY_INITRC := device/sony/mesona/recovery/init.rc
 BOARD_RECOVERYIMAGE_PARTITION_SIZE := 8388608
 BOARD_USES_DUALBOOT_RECOVERY := true
 # CM7 CWM recovery embeds libbusybox; prebuilt busybox-recovery would clobber /sbin/recovery via symlink

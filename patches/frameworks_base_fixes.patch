@@ -1,0 +1,89 @@
+diff --git a/cmds/bootanimation/BootAnimation.cpp b/cmds/bootanimation/BootAnimation.cpp
+index c9aa6f0..e2d6fb2 100644
+--- a/cmds/bootanimation/BootAnimation.cpp
++++ b/cmds/bootanimation/BootAnimation.cpp
+@@ -146,7 +146,7 @@ status_t BootAnimation::initTexture(void* buffer, size_t len)
+     //StopWatch watch("blah");
+ 
+     SkBitmap bitmap;
+-    SkImageDecoder::DecodeMemory(buffer, len,
++    bool success = SkImageDecoder::DecodeMemory(buffer, len,
+             &bitmap, SkBitmap::kRGB_565_Config,
+             SkImageDecoder::kDecodePixels_Mode);
+ 
+@@ -157,6 +157,10 @@ status_t BootAnimation::initTexture(void* buffer, size_t len)
+     const int w = bitmap.width();
+     const int h = bitmap.height();
+     const void* p = bitmap.getPixels();
++    if (!success || !p) {
++        LOGW("BootAnimation initTexture failed: len=%u", len);
++        return BAD_VALUE;
++    }
+ 
+     GLint crop[4] = { 0, h, w, -h };
+     int tw = 1 << (31 - __builtin_clz(w));
+@@ -254,6 +258,11 @@ status_t BootAnimation::readyToRun() {
+         }
+     }
+ 
++    // Keep boot logo visible for ~2.5 seconds before starting animation
++    for (int i = 0; i < 25 && !exitPending(); i++) {
++        usleep(100000);
++    }
++
+     return NO_ERROR;
+ }
+ 
+@@ -418,6 +427,12 @@ bool BootAnimation::movie()
+     }
+ 
+     // clear screen
++    LOGI("BootAnimation movie: %dx%d @ %dfps, parts=%u", animation.width, animation.height, animation.fps, pcount);
++    for (size_t i=0; i<pcount; i++) {
++        LOGI("Part %u: path=%s, frames=%u, count=%d, pause=%d",
++             i, animation.parts[i].path.string(), animation.parts[i].frames.size(),
++             animation.parts[i].count, animation.parts[i].pause);
++    }
+     glShadeModel(GL_FLAT);
+     glDisable(GL_DITHER);
+     glDisable(GL_SCISSOR_TEST);
+@@ -478,14 +493,21 @@ bool BootAnimation::movie()
+                     glDisable(GL_SCISSOR_TEST);
+                 }
+                 glDrawTexiOES(xc, yc, 0, animation.width, animation.height);
+-                eglSwapBuffers(mDisplay, mSurface);
++                EGLBoolean swapOk = eglSwapBuffers(mDisplay, mSurface);
++                EGLint eglErr = eglGetError();
++                GLenum glErr = glGetError();
++                if (!swapOk || eglErr != EGL_SUCCESS || glErr != GL_NO_ERROR) {
++                    LOGE("BootAnimation swap: ok=%d, eglErr=0x%04x, glErr=0x%04x", (int)swapOk, eglErr, glErr);
++                }
+ 
+                 nsecs_t now = systemTime();
+                 nsecs_t delay = frameDuration - (now - lastFrame);
+                 lastFrame = now;
+-                long wait = ns2us(frameDuration);
+-                if (wait > 0)
++                long wait = ns2us(delay);
++                if (wait > 0) {
+                     usleep(wait);
++                    lastFrame = systemTime();
++                }
+             }
+             usleep(part.pause * ns2us(frameDuration));
+         }
+diff --git a/packages/SettingsProvider/src/com/android/providers/settings/DatabaseHelper.java b/packages/SettingsProvider/src/com/android/providers/settings/DatabaseHelper.java
+index f7ec294..133f8a5 100644
+--- a/packages/SettingsProvider/src/com/android/providers/settings/DatabaseHelper.java
++++ b/packages/SettingsProvider/src/com/android/providers/settings/DatabaseHelper.java
+@@ -1073,6 +1073,10 @@ public class DatabaseHelper extends SQLiteOpenHelper {
+             loadBooleanSetting(stmt, Settings.System.NOTIFICATIONS_USE_RING_VOLUME,
+                     R.bool.def_notifications_use_ring_volume);
+ 
++            // Keep Wi-Fi connected on sleep to avoid DORMANT/UnknownHostException disconnects
++            loadSetting(stmt, Settings.System.WIFI_SLEEP_POLICY,
++                    Settings.System.WIFI_SLEEP_POLICY_NEVER);
++
+         } finally {
+             if (stmt != null) stmt.close();
+         }
