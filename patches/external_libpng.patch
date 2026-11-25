@@ -1,0 +1,14 @@
+diff --git a/pngread.c b/pngread.c
+index fc4788b..45427f7 100644
+--- a/pngread.c
++++ b/pngread.c
+@@ -778,7 +778,8 @@ png_read_row(png_structp png_ptr, png_bytep row, png_bytep dsp_row)
+       }
+       if (ret != Z_OK)
+ #ifdef PNG_INDEX_SUPPORTED
+-         if (png_ptr->index && png_ptr->row_number != png_ptr->height - 1)
++         if (!png_ptr->index || png_ptr->row_number != png_ptr->height - 1 ||
++             png_ptr->zstream.avail_out)
+ #endif
+             png_error(png_ptr, png_ptr->zstream.msg ? png_ptr->zstream.msg :
+                    "Decompression error");

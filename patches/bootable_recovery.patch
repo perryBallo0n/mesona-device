@@ -1,0 +1,208 @@
+diff --git a/bootloader.c b/bootloader.c
+index b690c55..d1f29cf 100644
+--- a/bootloader.c
++++ b/bootloader.c
+@@ -30,6 +30,7 @@ static int set_bootloader_message_block(const struct bootloader_message *in, con
+ 
+ int get_bootloader_message(struct bootloader_message *out) {
+     Volume* v = volume_for_path("/misc");
++    if (v == NULL) return -1;
+     if (strcmp(v->fs_type, "mtd") == 0) {
+         return get_bootloader_message_mtd(out, v);
+     } else if (strcmp(v->fs_type, "emmc") == 0) {
+@@ -41,6 +42,7 @@ int get_bootloader_message(struct bootloader_message *out) {
+ 
+ int set_bootloader_message(const struct bootloader_message *in) {
+     Volume* v = volume_for_path("/misc");
++    if (v == NULL) return -1;
+     if (strcmp(v->fs_type, "mtd") == 0) {
+         return set_bootloader_message_mtd(in, v);
+     } else if (strcmp(v->fs_type, "emmc") == 0) {
+diff --git a/etc/init.rc b/etc/init.rc
+index a675a4b..a8478ca 100644
+--- a/etc/init.rc
++++ b/etc/init.rc
+@@ -10,6 +10,7 @@ on init
+     symlink /system/etc /etc
+ 
+     mkdir /sdcard
++    mkdir /external_sd
+     mkdir /system
+     mkdir /data
+     mkdir /cache
+@@ -21,6 +22,13 @@ on boot
+     hostname localhost
+     domainname localdomain
+ 
++    write /sys/module/msm_fb/parameters/align_buffer 1
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 0fce
++    write /sys/class/android_usb/android0/idProduct 6176
++    write /sys/class/android_usb/android0/functions mass_storage,adb
++    write /sys/class/android_usb/android0/enable 1
++    exec /sbin/busybox --install -s /sbin
+     class_start default
+ 
+ service ueventd /sbin/ueventd
+@@ -36,3 +44,6 @@ on property:persist.service.adb.enable=1
+ 
+ on property:persist.service.adb.enable=0
+     stop adbd
++
++service rmt_storage /sbin/rmt_storage /dev/block/mmcblk0p12 /dev/block/mmcblk0p13 /dev/block/mmcblk0p14
++    user root
+diff --git a/install.c b/install.c
+index 5bb3a78..c49a2a3 100644
+--- a/install.c
++++ b/install.c
+@@ -37,6 +37,8 @@
+ #define PUBLIC_KEYS_FILE "/res/keys"
+ 
+ // If the package contains an update binary, extract it and run it.
++int signature_check_enabled = 0;
++
+ static int
+ try_update_binary(const char *path, ZipArchive *zip) {
+     const ZipEntry* binary_entry =
+@@ -248,27 +250,30 @@ install_package(const char *path)
+ 
+     ui_print("Opening update package...\n");
+ 
+-    int numKeys;
+-    RSAPublicKey* loadedKeys = load_keys(PUBLIC_KEYS_FILE, &numKeys);
+-    if (loadedKeys == NULL) {
+-        LOGE("Failed to load keys\n");
+-        return INSTALL_CORRUPT;
+-    }
+-    LOGI("%d key(s) loaded from %s\n", numKeys, PUBLIC_KEYS_FILE);
++    int err;
++    if (signature_check_enabled) {
++        int numKeys;
++        RSAPublicKey* loadedKeys = load_keys(PUBLIC_KEYS_FILE, &numKeys);
++        if (loadedKeys == NULL) {
++            LOGE("Failed to load keys\n");
++            return INSTALL_CORRUPT;
++        }
++        LOGI("%d key(s) loaded from %s\n", numKeys, PUBLIC_KEYS_FILE);
+ 
+-    // Give verification half the progress bar...
+-    ui_print("Verifying update package...\n");
+-    ui_show_progress(
+-            VERIFICATION_PROGRESS_FRACTION,
+-            VERIFICATION_PROGRESS_TIME);
++        ui_print("Verifying update package...\n");
++        ui_show_progress(
++                VERIFICATION_PROGRESS_FRACTION,
++                VERIFICATION_PROGRESS_TIME);
+ 
+-    int err;
+-    err = verify_file(path, loadedKeys, numKeys);
+-    free(loadedKeys);
+-    LOGI("verify_file returned %d\n", err);
+-    if (err != VERIFY_SUCCESS) {
+-        LOGE("signature verification failed\n");
+-        return INSTALL_CORRUPT;
++        err = verify_file(path, loadedKeys, numKeys);
++        free(loadedKeys);
++        LOGI("verify_file returned %d\n", err);
++        if (err != VERIFY_SUCCESS) {
++            LOGE("signature verification failed\n");
++            return INSTALL_CORRUPT;
++        }
++    } else {
++        ui_print("Signature verification skipped.\n");
+     }
+ 
+     /* Try to open the package.
+diff --git a/install.h b/install.h
+index a7ebc09..663e6e1 100644
+--- a/install.h
++++ b/install.h
+@@ -20,6 +20,7 @@
+ #include "common.h"
+ 
+ enum { INSTALL_SUCCESS, INSTALL_ERROR, INSTALL_CORRUPT };
++extern int signature_check_enabled;
+ int install_package(const char *root_path);
+ 
+ #endif  // RECOVERY_INSTALL_H_
+diff --git a/recovery.c b/recovery.c
+index 9ad075d..de6a23d 100644
+--- a/recovery.c
++++ b/recovery.c
+@@ -302,7 +302,7 @@ finish_recovery(const char *send_intent) {
+     sync();  // For good measure.
+ }
+ 
+-static int
++int
+ erase_volume(const char *volume) {
+     ui_set_background(BACKGROUND_ICON_INSTALLING);
+     ui_show_indeterminate_progress();
+@@ -410,8 +410,7 @@ copy_sideloaded_package(const char* original_path) {
+ 
+ static char**
+ prepend_title(const char** headers) {
+-    char* title[] = { "Android system recovery <"
+-                          EXPAND(RECOVERY_API_VERSION) "e>",
++    char* title[] = { "Android system recovery (CWM)",
+                       "",
+                       NULL };
+ 
+@@ -651,6 +650,7 @@ prompt_and_wait() {
+         // return one of the core actions handled in the switch
+         // statement below.
+         chosen_item = device_perform_action(chosen_item);
++        if (chosen_item < 0) continue;
+ 
+         switch (chosen_item) {
+             case ITEM_REBOOT:
+@@ -821,3 +821,31 @@ main(int argc, char **argv) {
+     reboot(RB_AUTOBOOT);
+     return EXIT_SUCCESS;
+ }
++
++
++char** rec_prepend_title(const char** headers) {
++    return prepend_title(headers);
++}
++
++int rec_get_menu_selection(char** headers, char** items, int menu_only, int initial_selection) {
++    return get_menu_selection(headers, items, menu_only, initial_selection);
++}
++
++int rec_confirm_selection(const char* title, const char* yes_label) {
++    const char* hdr[] = { title, "  THIS CAN NOT BE UNDONE.", "", NULL };
++    char** title_headers = prepend_title(hdr);
++    char* items[] = { " No", " No", " No", " No", " No",
++                      (char*)yes_label,
++                      " No", " No", NULL };
++    int chosen = get_menu_selection(title_headers, items, 1, 0);
++    free(title_headers);
++    return chosen == 5;
++}
++
++int rec_sdcard_directory(const char* path) {
++    return sdcard_directory(path);
++}
++
++int rec_install_package(const char* path) {
++    return install_package(path);
++}
+diff --git a/recovery_ui.h b/recovery_ui.h
+index e451bdf..55c63c8 100644
+--- a/recovery_ui.h
++++ b/recovery_ui.h
+@@ -76,4 +76,12 @@ extern char* MENU_HEADERS[];
+ // Text of menu items.
+ extern char* MENU_ITEMS[];
+ 
++
++extern int rec_get_menu_selection(char** headers, char** items, int menu_only, int initial_selection);
++extern int rec_confirm_selection(const char* title, const char* yes_label);
++extern int rec_sdcard_directory(const char* path);
++extern char** rec_prepend_title(const char** headers);
++extern int rec_install_package(const char* path);
++
++extern int erase_volume(const char *volume);
+ #endif

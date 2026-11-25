@@ -22,8 +22,8 @@ sleep 12
 if [ -f /data/data/com.google.android.gsf/databases/gservices.db ]; then
     sqlite3 /data/data/com.google.android.gsf/databases/gservices.db "INSERT OR REPLACE INTO overrides (name, value) VALUES ('vending_tos_version', '1');"
     sqlite3 /data/data/com.google.android.gsf/databases/gservices.db "INSERT OR REPLACE INTO overrides (name, value) VALUES ('vending_tos_url', 'http://api.oldmarket.xyz:5000');"
-    sqlite3 /data/data/com.google.android.gsf/databases/gservices.db "INSERT OR REPLACE INTO overrides (name, value) VALUES ('gms_disable:com.google.android.youtube', 'enabled');"
-    sqlite3 /data/data/com.google.android.gsf/databases/gservices.db "INSERT OR REPLACE INTO overrides (name, value) VALUES ('gms_disable:com.google.android.apps.books', 'enabled');"
+    sqlite3 /data/data/com.google.android.gsf/databases/gservices.db "INSERT OR REPLACE INTO overrides (name, value) VALUES ('gms_disable:com.google.android.youtube', '0 enabled');"
+    sqlite3 /data/data/com.google.android.gsf/databases/gservices.db "INSERT OR REPLACE INTO overrides (name, value) VALUES ('gms_disable:com.google.android.apps.books', '0 enabled');"
 fi
 
 pm enable com.google.android.youtube

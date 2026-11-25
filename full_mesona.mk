@@ -57,6 +57,7 @@ PRODUCT_COPY_FILES += device/sony/mesona/vold.fstab:system/etc/vold.fstab
 PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/media_profiles.xml:system/etc/media_profiles.xml
 
 PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/rmt_storage:system/bin/rmt_storage
+PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/rmt_storage:root/sbin/rmt_storage
 
 PRODUCT_PACKAGES += lights.msm7x27a boot_rainbow
 PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/initlogo.rle:root/initlogo.rle
