@@ -51,6 +51,7 @@ static void my_term_destination(j_compress_ptr cinfo) {
 }
 
 static int compress_nv21_to_jpeg(const uint8_t *nv21, int width, int height, int quality,
+                                 int rotation_deg,
                                  uint8_t *out_jpeg, size_t max_out_sz, size_t *out_sz) {
     if (!nv21 || !out_jpeg || !out_sz || width <= 0 || height <= 0) return -1;
 
@@ -69,8 +70,13 @@ static int compress_nv21_to_jpeg(const uint8_t *nv21, int width, int height, int
     *out_sz = 0;
     cinfo.dest = (struct jpeg_destination_mgr *)&dest;
 
-    cinfo.image_width = width;
-    cinfo.image_height = height;
+    int rot = ((rotation_deg % 360) + 360) % 360;
+    if (rot != 0 && rot != 90 && rot != 180 && rot != 270) rot = 0;
+    int out_w = (rot == 90 || rot == 270) ? height : width;
+    int out_h = (rot == 90 || rot == 270) ? width : height;
+
+    cinfo.image_width = out_w;
+    cinfo.image_height = out_h;
     cinfo.input_components = 3;
     cinfo.in_color_space = JCS_RGB;
 
@@ -81,20 +87,30 @@ static int compress_nv21_to_jpeg(const uint8_t *nv21, int width, int height, int
     const uint8_t *y_plane = nv21;
     const uint8_t *vu_plane = nv21 + width * height;
     JSAMPROW row_pointer[1];
-    uint8_t *rgb_row = (uint8_t *)malloc(width * 3);
+    uint8_t *rgb_row = (uint8_t *)malloc(out_w * 3);
     if (!rgb_row) {
         jpeg_destroy_compress(&cinfo);
         return -1;
     }
 
     while (cinfo.next_scanline < cinfo.image_height) {
-        int y = cinfo.next_scanline;
-        const uint8_t *y_row = y_plane + y * width;
-        const uint8_t *vu_row = vu_plane + (y / 2) * width;
-        for (int x = 0; x < width; x++) {
-            int Y = y_row[x];
-            int V = vu_row[(x & ~1)];
-            int U = vu_row[(x & ~1) + 1];
+        int oy = cinfo.next_scanline;
+        for (int ox = 0; ox < out_w; ox++) {
+            int sx = ox, sy = oy;
+            if (rot == 90) {
+                sx = oy;
+                sy = height - 1 - ox;
+            } else if (rot == 180) {
+                sx = width - 1 - ox;
+                sy = height - 1 - oy;
+            } else if (rot == 270) {
+                sx = width - 1 - oy;
+                sy = ox;
+            }
+            int Y = y_plane[sy * width + sx];
+            const uint8_t *vu_row = vu_plane + (sy >> 1) * width;
+            int V = vu_row[(sx & ~1)];
+            int U = vu_row[(sx & ~1) + 1];
 
             int c = Y - 16;
             int d = U - 128;
@@ -104,9 +120,9 @@ static int compress_nv21_to_jpeg(const uint8_t *nv21, int width, int height, int
             int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
             int b = (298 * c + 516 * d + 128) >> 8;
 
-            rgb_row[x * 3 + 0] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
-            rgb_row[x * 3 + 1] = (uint8_t)(g < 0 ? 0 : (g > 255 ? 255 : g));
-            rgb_row[x * 3 + 2] = (uint8_t)(b < 0 ? 0 : (b > 255 ? 255 : b));
+            rgb_row[ox * 3 + 0] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            rgb_row[ox * 3 + 1] = (uint8_t)(g < 0 ? 0 : (g > 255 ? 255 : g));
+            rgb_row[ox * 3 + 2] = (uint8_t)(b < 0 ? 0 : (b > 255 ? 255 : b));
         }
         row_pointer[0] = rgb_row;
         jpeg_write_scanlines(&cinfo, row_pointer, 1);
@@ -2916,6 +2932,7 @@ public:
     String8 m_meter_str;
     int m_ev_val;
     int m_led_mode;
+    int m_rotation;
     FocusModeKind m_focus_kind;
     bool m_has_focus_roi;
     bool m_roi_dirty;
@@ -3045,6 +3062,7 @@ public:
         m_meter_str("center-weighted"),
         m_ev_val(0),
         m_led_mode(K_LED_MODE_OFF),
+        m_rotation(0),
         m_focus_kind(FOCUS_AUTO),
         m_has_focus_roi(false),
         m_roi_dirty(false),
@@ -3458,8 +3476,8 @@ public:
             uint8_t* jpeg_out = (uint8_t*)malloc(max_jpeg_sz);
             size_t jpeg_sz = 0;
             if (jpeg_out) {
-                int ret = compress_nv21_to_jpeg(nv21_src, w, h, 85, jpeg_out, max_jpeg_sz, &jpeg_sz);
-                disk_log("snapshot_thread: compressed NV21 (%dx%d) to JPEG: ret=%d, size=%zu", w, h, ret, jpeg_sz);
+                int ret = compress_nv21_to_jpeg(nv21_src, w, h, 85, self->m_rotation, jpeg_out, max_jpeg_sz, &jpeg_sz);
+                disk_log("snapshot_thread: compressed NV21 (%dx%d, rot=%d) to JPEG: ret=%d, size=%zu", w, h, self->m_rotation, ret, jpeg_sz);
                 if (ret == 0 && jpeg_sz > 0 && self->m_data_cb) {
                     sp<MemoryHeapBase> heap = new MemoryHeapBase(jpeg_sz, 0, "cam_jpeg");
                     if (heap->getBase()) {
@@ -3538,6 +3556,7 @@ public:
         const char* p_ev    = params.get(CameraParameters::KEY_EXPOSURE_COMPENSATION);
         const char* p_meter = params.get("auto-exposure");
         const char* p_areas = params.get("focus-areas");
+        const char* p_rot   = params.get(CameraParameters::KEY_ROTATION);
 
         disk_log("QcomCameraAdapter::setParameters ENTER: prev=%s pic=%s focus=%s flash=%s wb=%s ev=%s scene=%s",
                  params.get(CameraParameters::KEY_PREVIEW_SIZE),
@@ -3581,6 +3600,12 @@ public:
             m_has_focus_roi = true;
         } else {
             m_has_focus_roi = false;
+        }
+        if (p_rot) {
+            int r = ((atoi(p_rot) % 360) + 360) % 360;
+            if (r == 0 || r == 90 || r == 180 || r == 270) {
+                m_rotation = r;
+            }
         }
         m_params_inited = true;
 
@@ -3677,6 +3702,9 @@ public:
 
         params.set("auto-exposure-values", "frame-average,center-weighted,spot-metering");
         params.set("auto-exposure", m_meter_str.string());
+        char rot_buf[16];
+        snprintf(rot_buf, sizeof(rot_buf), "%d", m_rotation);
+        params.set(CameraParameters::KEY_ROTATION, rot_buf);
 
         disk_log("QcomCameraAdapter::getParameters EXIT: prev=%s pic=%s focus=%s flash=%s wb=%s ev=%s scene=%s",
                  params.get(CameraParameters::KEY_PREVIEW_SIZE),
