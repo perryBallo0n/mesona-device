@@ -88,7 +88,7 @@ index f7ec294..133f8a5 100644
              if (stmt != null) stmt.close();
          }
 diff --git a/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java b/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
-index 8e6706c..2e87ce8 100644
+index 8e6706c..ee1007e 100644
 --- a/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
 +++ b/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
 @@ -52,6 +52,8 @@ import android.view.KeyEvent;
@@ -100,7 +100,15 @@ index 8e6706c..2e87ce8 100644
  
  
  /**
-@@ -308,6 +310,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -290,6 +292,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+         mUpdateMonitor = new KeyguardUpdateMonitor(context);
+ 
+         mUpdateMonitor.registerSimStateCallback(this);
++        mUpdateMonitor.registerInfoCallback(mBatteryLedCallback);
+ 
+         mLockPatternUtils = new LockPatternUtils(mContext);
+ 
+@@ -308,6 +311,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          IntentFilter iF = new IntentFilter();
          iF.addAction("com.android.music.metachanged");
          iF.addAction("com.android.music.playstatechanged");
@@ -108,7 +116,7 @@ index 8e6706c..2e87ce8 100644
          mContext.registerReceiver(mMusicReceiver, iF);
  
          mShowLockIcon = (Settings.System.getInt(cr, "show_status_bar_lock", 0) == 1);
-@@ -1164,6 +1167,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1164,6 +1168,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
              } catch (RemoteException e) {
              }
              mShowKeyguardWakeLock.release();
@@ -116,15 +124,15 @@ index 8e6706c..2e87ce8 100644
          }
      }
  
-@@ -1189,6 +1193,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1189,6 +1194,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
              mShowing = false;
              adjustUserActivityLocked();
              adjustStatusBarLocked();
-+            triggerUnlockLedFlash();
++            updateBottomLedBar();
          }
      }
  
-@@ -1296,6 +1301,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1296,6 +1302,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          synchronized (KeyguardViewMediator.this) {
              if (DEBUG) Log.d(TAG, "handleNotifyScreenOff");
              mKeyguardViewManager.onScreenTurnedOff();
@@ -132,7 +140,7 @@ index 8e6706c..2e87ce8 100644
          }
      }
  
-@@ -1307,6 +1313,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1307,6 +1314,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          synchronized (KeyguardViewMediator.this) {
              if (DEBUG) Log.d(TAG, "handleNotifyScreenOn");
              mKeyguardViewManager.onScreenTurnedOn();
@@ -140,7 +148,7 @@ index 8e6706c..2e87ce8 100644
          }
      }
      private BroadcastReceiver mMusicReceiver = new BroadcastReceiver() {
-@@ -1314,13 +1321,22 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1314,13 +1322,22 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          @Override
          public void onReceive(Context context, Intent intent) {
              String action = intent.getAction();
@@ -170,7 +178,7 @@ index 8e6706c..2e87ce8 100644
          }
      };
      public static String NowPlaying() {
-@@ -1338,6 +1354,112 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1338,6 +1355,223 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
      public static long AlbumId() {
          return mAlbumId;
      }
@@ -197,9 +205,70 @@ index 8e6706c..2e87ce8 100644
 +        }
 +    }
 +
-+    private static void setBottomRgb(int r, int g, int b, boolean breatheBlue) {
-+        StringBuilder sb = new StringBuilder();
-+        sb.append("3 4 0\n3 5 0\n3 6 0\n");
++    private static final int[][] BATTERY_LED_ANCHORS = {
++        { 100,   0, 180,  10 }, // Bright green
++        {  75,  15, 115,   0 }, // Dimmer green
++        {  50, 125, 120,   0 }, // Yellow-green / yellow
++        {  25, 180,  60,   0 }, // Warm orange
++        {  10, 190,  10,   0 }, // Red
++    };
++
++    private int mCurLedR = 0;
++    private int mCurLedG = 0;
++    private int mCurLedB = 0;
++    private int mTargetLedR = 0;
++    private int mTargetLedG = 0;
++    private int mTargetLedB = 0;
++    private int mLastBatteryLevel = -1;
++    private Runnable mLedFadeRunnable = null;
++    private long mLastMusicFalseMs = 0L;
++
++    private final KeyguardUpdateMonitor.InfoCallback mBatteryLedCallback =
++            new KeyguardUpdateMonitor.InfoCallback() {
++        public void onRefreshBatteryInfo(boolean showBatteryInfo, boolean pluggedIn, int batteryLevel) {
++            mLastBatteryLevel = batteryLevel;
++            if (mShowing && mScreenOn && !isMusicPlayingActive()) {
++                updateBottomLedBar();
++            }
++        }
++        public void onTimeChanged() {}
++        public void onMusicChanged() {}
++        public void onRefreshCarrierInfo(CharSequence plmn, CharSequence spn) {}
++        public void onRingerModeChanged(int state) {}
++        public void onPhoneStateChanged(String newState) {}
++    };
++
++    private static int[] getBatteryBarColor(int level) {
++        if (level >= BATTERY_LED_ANCHORS[0][0]) {
++            return new int[] {
++                BATTERY_LED_ANCHORS[0][1], BATTERY_LED_ANCHORS[0][2], BATTERY_LED_ANCHORS[0][3]
++            };
++        }
++        int last = BATTERY_LED_ANCHORS.length - 1;
++        if (level <= BATTERY_LED_ANCHORS[last][0]) {
++            return new int[] {
++                BATTERY_LED_ANCHORS[last][1], BATTERY_LED_ANCHORS[last][2], BATTERY_LED_ANCHORS[last][3]
++            };
++        }
++        for (int i = 0; i < last; i++) {
++            int hiLvl = BATTERY_LED_ANCHORS[i][0];
++            int loLvl = BATTERY_LED_ANCHORS[i + 1][0];
++            if (level <= hiLvl && level >= loLvl) {
++                float t = (float) (hiLvl - level) / (float) (hiLvl - loLvl);
++                int r = Math.round(BATTERY_LED_ANCHORS[i][1] + t * (BATTERY_LED_ANCHORS[i + 1][1] - BATTERY_LED_ANCHORS[i][1]));
++                int g = Math.round(BATTERY_LED_ANCHORS[i][2] + t * (BATTERY_LED_ANCHORS[i + 1][2] - BATTERY_LED_ANCHORS[i][2]));
++                int b = Math.round(BATTERY_LED_ANCHORS[i][3] + t * (BATTERY_LED_ANCHORS[i + 1][3] - BATTERY_LED_ANCHORS[i][3]));
++                return new int[] { r, g, b };
++            }
++        }
++        return new int[] { 0, 180, 10 };
++    }
++
++    private static void writeBottomRgbSteady(int r, int g, int b, boolean clearEffects) {
++        StringBuilder sb = new StringBuilder(64);
++        if (clearEffects) {
++            sb.append("3 4 0\n3 5 0\n3 6 0\n");
++        }
 +        if (r > 0) {
 +            sb.append("4 4 ").append(r).append("\n1 4 1\n");
 +        } else {
@@ -211,18 +280,85 @@ index 8e6706c..2e87ce8 100644
 +            sb.append("1 5 0\n");
 +        }
 +        if (b > 0) {
-+            if (breatheBlue) {
-+                sb.append("1 6 0\n25 6 ").append(b).append("\n6 6 3\n3 6 1\n");
-+            } else {
-+                sb.append("4 6 ").append(b).append("\n1 6 1\n");
-+            }
++            sb.append("4 6 ").append(b).append("\n1 6 1\n");
 +        } else {
 +            sb.append("1 6 0\n");
 +        }
 +        writeFihLedCmd(sb.toString());
 +    }
 +
-+    private long mLastMusicFalseMs = 0L;
++    private void animateBottomRgb(final int targetR, final int targetG, final int targetB,
++            final int totalSteps, final int stepMs, final boolean releaseBusyOnFinish) {
++        if (mLedFadeRunnable != null &&
++                mTargetLedR == targetR && mTargetLedG == targetG && mTargetLedB == targetB) {
++            return;
++        }
++        if (mLedFadeRunnable == null &&
++                mCurLedR == targetR && mCurLedG == targetG && mCurLedB == targetB &&
++                targetR == mTargetLedR && targetG == mTargetLedG && targetB == mTargetLedB) {
++            if (releaseBusyOnFinish) {
++                SystemProperties.set("sys.fih_led.busy", "0");
++            }
++            return;
++        }
++
++        if (mLedFadeRunnable != null) {
++            mHandler.removeCallbacks(mLedFadeRunnable);
++            mLedFadeRunnable = null;
++        }
++
++        final int startR = mCurLedR;
++        final int startG = mCurLedG;
++        final int startB = mCurLedB;
++        mTargetLedR = targetR;
++        mTargetLedG = targetG;
++        mTargetLedB = targetB;
++
++        if (totalSteps <= 1 || (startR == targetR && startG == targetG && startB == targetB)) {
++            mCurLedR = targetR;
++            mCurLedG = targetG;
++            mCurLedB = targetB;
++            writeBottomRgbSteady(targetR, targetG, targetB, true);
++            if (releaseBusyOnFinish) {
++                SystemProperties.set("sys.fih_led.busy", "0");
++            }
++            return;
++        }
++
++        mLedFadeRunnable = new Runnable() {
++            int step = 0;
++            public void run() {
++                synchronized (KeyguardViewMediator.this) {
++                    if (mLedFadeRunnable != this) {
++                        return;
++                    }
++                    step++;
++                    float u = (float) step / (float) totalSteps;
++                    if (u > 1.0f) u = 1.0f;
++                    float ease = u * u * (3.0f - 2.0f * u);
++                    int r = Math.round(startR + (targetR - startR) * ease);
++                    int g = Math.round(startG + (targetG - startG) * ease);
++                    int b = Math.round(startB + (targetB - startB) * ease);
++                    mCurLedR = r;
++                    mCurLedG = g;
++                    mCurLedB = b;
++                    writeBottomRgbSteady(r, g, b, step == 1);
++                    if (step < totalSteps) {
++                        mHandler.postDelayed(this, stepMs);
++                    } else {
++                        mLedFadeRunnable = null;
++                        if (targetR == 0 && targetG == 0 && targetB == 0) {
++                            writeFihLedCmd("1 4 0\n1 5 0\n1 6 0\n");
++                        }
++                        if (releaseBusyOnFinish) {
++                            SystemProperties.set("sys.fih_led.busy", "0");
++                        }
++                    }
++                }
++            }
++        };
++        mHandler.post(mLedFadeRunnable);
++    }
 +
 +    private boolean isMusicPlayingActive() {
 +        if (Boolean.TRUE.equals(mPlaying)) return true;
@@ -237,47 +373,30 @@ index 8e6706c..2e87ce8 100644
 +        }
 +    }
 +
-+    private void triggerUnlockLedFlash() {
-+        if (isMusicPlayingActive()) {
-+            updateBottomLedBar();
-+            return;
-+        }
-+        SystemProperties.set("sys.fih_led.busy", "1");
-+        setBottomRgb(0, 90, 150, false);
-+        mHandler.postDelayed(new Runnable() {
-+            public void run() {
-+                updateBottomLedBar();
-+            }
-+        }, 120);
-+    }
-+
 +    private synchronized void updateBottomLedBar() {
-+        boolean musicPlaying = isMusicPlayingActive();
-+        if (musicPlaying) {
++        if (isMusicPlayingActive()) {
 +            SystemProperties.set("sys.fih_led.busy", "1");
 +            int idx = (int) (Math.abs(mSongId) % MUSIC_PALETTE.length);
 +            int[] c = MUSIC_PALETTE[idx];
-+            setBottomRgb(c[0], c[1], c[2], c[2] >= 100 && c[0] < 80);
++            animateBottomRgb(c[0], c[1], c[2], 12, 25, false);
 +            return;
 +        }
 +
 +        if (mShowing && mScreenOn) {
-+            // Soft cyan-blue lockscreen accent
 +            SystemProperties.set("sys.fih_led.busy", "1");
-+            setBottomRgb(0, 45, 135, true);
++            int level = (mLastBatteryLevel >= 0) ? mLastBatteryLevel
++                    : (mUpdateMonitor != null ? mUpdateMonitor.getBatteryLevel() : 100);
++            int[] c = getBatteryBarColor(level);
++            animateBottomRgb(c[0], c[1], c[2], 14, 25, false);
 +            return;
 +        }
 +
-+        SystemProperties.set("sys.fih_led.busy", "0");
-+        if (!mScreenOn && mUpdateMonitor != null && mUpdateMonitor.isDevicePluggedIn()) {
-+            // Preserve subtle dim charging accent when screen turns off
-+            if (mUpdateMonitor.isDeviceCharged()) {
-+                setBottomRgb(0, 35, 0, false);
-+            } else {
-+                setBottomRgb(40, 14, 0, false);
-+            }
++        // Keep bottom bar off when unlocked or screen off (and never light it while charging).
++        if (mCurLedR != 0 || mCurLedG != 0 || mCurLedB != 0 || mLedFadeRunnable != null) {
++            SystemProperties.set("sys.fih_led.busy", "1");
++            animateBottomRgb(0, 0, 0, mScreenOn ? 12 : 8, 25, true);
 +        } else {
-+            setBottomRgb(0, 0, 0, false);
++            SystemProperties.set("sys.fih_led.busy", "0");
 +        }
 +    }
  }

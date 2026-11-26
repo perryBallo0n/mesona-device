@@ -15,7 +15,7 @@ index 4168a30..795b31d 100644
  LOCAL_MODULE := lights.$(TARGET_BOARD_PLATFORM)
  
 diff --git a/liblights/lights.c b/liblights/lights.c
-index 555833b..8f07d26 100644
+index 555833b..576c29d 100644
 --- a/liblights/lights.c
 +++ b/liblights/lights.c
 @@ -19,6 +19,7 @@
@@ -84,7 +84,7 @@ index 555833b..8f07d26 100644
  static int
  set_speaker_light_locked(struct light_device_t* dev,
          struct light_state_t const* state)
-@@ -232,6 +284,18 @@ set_speaker_light_locked(struct light_device_t* dev,
+@@ -232,6 +284,16 @@ set_speaker_light_locked(struct light_device_t* dev,
          write_int(RED_LED_FILE, red);
          write_int(GREEN_LED_FILE, green);
          write_int(BLUE_LED_FILE, blue);
@@ -92,11 +92,9 @@ index 555833b..8f07d26 100644
 +        write_fih_led(0, red > 0 ? 1 : 0);
 +        write_fih_led(1, green > 0 ? 1 : 0);
 +        write_fih_led(2, blue > 0 ? 1 : 0);
-+        // Also accent bottom chin RGB bar (channels 4,5,6) softly when not overridden by Lockscreen/Music
++        // Accent bottom chin RGB bar (channels 4,5,6) only for notifications (stay off while charging)
 +        if (is_lit(&g_notification)) {
 +            write_fih_sub_bar(red, green, blue, 150, (onMS > 0 && offMS > 0) ? 1 : 0);
-+        } else if (is_lit(&g_battery)) {
-+            write_fih_sub_bar(red, green, blue, 40, (onMS > 0 && offMS > 0) ? 1 : 0);
 +        } else {
 +            write_fih_sub_bar(0, 0, 0, 0, 0);
 +        }
