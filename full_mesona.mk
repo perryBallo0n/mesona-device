@@ -86,3 +86,10 @@ PRODUCT_COPY_FILES +=     device/common/gps/gps.conf_US_SUPL:system/etc/gps.conf
 # Root & Superuser
 PRODUCT_PACKAGES += su Superuser
 PRODUCT_PACKAGES += bootrec
+
+# ZRAM 128 MB init script
+PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/init_zram.sh:system/etc/init_zram.sh
+PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/busybox-recovery:system/xbin/busybox
+
+BUILD_DATE_ID := $(shell date +%Y%m%d)
+PRODUCT_BUILD_PROP_OVERRIDES += BUILD_DISPLAY_ID=$(BUILD_DATE_ID) BUILD_NUMBER=$(BUILD_DATE_ID)

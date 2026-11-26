@@ -1,0 +1,170 @@
+diff --git a/core/Makefile b/core/Makefile
+index f4669f2..c065e9d 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -140,6 +140,7 @@ $(INSTALLED_BUILD_PROP_TARGET): $(BUILDINFO_SH) $(INTERNAL_BUILD_ID_MAKEFILE)
+ 			TARGET_BOARD_PLATFORM="$(TARGET_BOARD_PLATFORM)" \
+ 			TARGET_CPU_ABI="$(TARGET_CPU_ABI)" \
+ 			TARGET_CPU_ABI2="$(TARGET_CPU_ABI2)" \
++			$(PRODUCT_BUILD_PROP_OVERRIDES) \
+ 	        bash $(BUILDINFO_SH) > $@
+ 	$(hide) if [ -f $(TARGET_DEVICE_DIR)/system.prop ]; then \
+ 	          cat $(TARGET_DEVICE_DIR)/system.prop >> $@; \
+@@ -362,10 +363,28 @@ $(INSTALLED_BOOTIMAGE_TARGET): $(MKEXT2IMG) $(INTERNAL_BOOTIMAGE_FILES)
+ 
+ else # TARGET_BOOTIMAGE_USE_EXT2 != true
+ 
++ifeq ($(BOARD_USES_DUALBOOT_RECOVERY),true)
++DUALBOOT_RAMDISK_TARGET := $(PRODUCT_OUT)/ramdisk-dualboot.img
++DUALBOOT_ROOT_STAGING := $(PRODUCT_OUT)/root_dualboot
++MKELF_SCRIPT := device/sony/mesona/tools/mkelf.py
++
++ifeq ($(BOARD_USES_SONY_ELF_BOOTIMG),true)
++$(INSTALLED_BOOTIMAGE_TARGET): $(INSTALLED_KERNEL_TARGET) $(DUALBOOT_RAMDISK_TARGET) $(MKELF_SCRIPT)
++	$(call pretty,"Target Sony ELF dual-boot image: $@")
++	$(hide) python $(MKELF_SCRIPT) --kernel $(INSTALLED_KERNEL_TARGET) --ramdisk $(DUALBOOT_RAMDISK_TARGET) $(if $(BOARD_KERNEL_CMDLINE),--cmdline "$(BOARD_KERNEL_CMDLINE)") --output $@
++	$(hide) $(call assert-max-image-size,$@,$(BOARD_BOOTIMAGE_PARTITION_SIZE),raw)
++else
++$(INSTALLED_BOOTIMAGE_TARGET): $(MKBOOTIMG) $(INSTALLED_KERNEL_TARGET) $(INSTALLED_2NDBOOTLOADER_TARGET) $(DUALBOOT_RAMDISK_TARGET)
++	$(call pretty,"Target dual-boot image: $@")
++	$(hide) $(MKBOOTIMG) $(addprefix --second ,$(INSTALLED_2NDBOOTLOADER_TARGET)) --kernel $(INSTALLED_KERNEL_TARGET) --ramdisk $(DUALBOOT_RAMDISK_TARGET) $(if $(BOARD_KERNEL_CMDLINE),--cmdline "$(BOARD_KERNEL_CMDLINE)") $(if $(BOARD_KERNEL_BASE),--base $(BOARD_KERNEL_BASE)) $(if $(BOARD_KERNEL_PAGESIZE),--pagesize $(BOARD_KERNEL_PAGESIZE)) --output $@
++	$(hide) $(call assert-max-image-size,$@,$(BOARD_BOOTIMAGE_PARTITION_SIZE),raw)
++endif
++else
+ $(INSTALLED_BOOTIMAGE_TARGET): $(MKBOOTIMG) $(INTERNAL_BOOTIMAGE_FILES)
+ 	$(call pretty,"Target boot image: $@")
+ 	$(hide) $(MKBOOTIMG) $(INTERNAL_BOOTIMAGE_ARGS) --output $@
+ 	$(hide) $(call assert-max-image-size,$@,$(BOARD_BOOTIMAGE_PARTITION_SIZE),raw)
++endif
+ endif # TARGET_BOOTIMAGE_USE_EXT2
+ 
+ else	# TARGET_NO_KERNEL
+@@ -583,7 +602,7 @@ INTERNAL_USERIMAGES_BINARY_PATHS := $(sort $(dir $(INTERNAL_USERIMAGES_DEPS)))
+ # $(5): size of the partition
+ define build-userimage-ext-target
+   @mkdir -p $(dir $(2))
+-    $(hide) PATH=$(foreach p,$(INTERNAL_USERIMAGES_BINARY_PATHS),$(p):)$(PATH) \
++    $(hide) PATH="$(foreach p,$(INTERNAL_USERIMAGES_BINARY_PATHS),$(p):)$$PATH" \
+ 	  $(MKEXT2USERIMG) $(1) $(2) $(4) $(3) $(5)
+ endef
+ else
+@@ -651,16 +670,15 @@ $(RECOVERY_INSTALL_OTA_KEYS): $(OTA_PUBLIC_KEYS) $(DUMPKEY_JAR)
+ 	@mkdir -p $(dir $@)
+ 	java -jar $(DUMPKEY_JAR) $(PRIVATE_OTA_PUBLIC_KEYS) > $@
+ 
+-$(INSTALLED_RECOVERYIMAGE_TARGET): $(MKBOOTFS) $(MKBOOTIMG) $(MINIGZIP) \
++$(recovery_ramdisk): $(MKBOOTFS) $(MINIGZIP) \
+ 		$(INSTALLED_RAMDISK_TARGET) \
+-		$(INSTALLED_BOOTIMAGE_TARGET) \
+ 		$(recovery_binary) \
+-		$(recovery_initrc) $(recovery_kernel) \
+-		$(INSTALLED_2NDBOOTLOADER_TARGET) \
++		$(recovery_initrc) \
+ 		$(recovery_build_prop) $(recovery_resource_deps) \
+ 		$(recovery_fstab) \
++		$(TARGET_RECOVERY_PREBUILT_BUSYBOX) \
+ 		$(RECOVERY_INSTALL_OTA_KEYS)
+-	@echo ----- Making recovery image ------
++	@echo ----- Making recovery ramdisk ------
+ 	rm -rf $(TARGET_RECOVERY_OUT)
+ 	mkdir -p $(TARGET_RECOVERY_OUT)
+ 	mkdir -p $(TARGET_RECOVERY_ROOT_OUT)
+@@ -668,10 +686,12 @@ $(INSTALLED_RECOVERYIMAGE_TARGET): $(MKBOOTFS) $(MKBOOTIMG) $(MINIGZIP) \
+ 	mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/tmp
+ 	echo Copying baseline ramdisk...
+ 	cp -R $(TARGET_ROOT_OUT) $(TARGET_RECOVERY_OUT)
+-	rm $(TARGET_RECOVERY_ROOT_OUT)/init*.rc
++	rm -f $(TARGET_RECOVERY_ROOT_OUT)/init*.rc $(TARGET_RECOVERY_ROOT_OUT)/sbin/bootrec
+ 	echo Modifying ramdisk contents...
+ 	cp -f $(recovery_initrc) $(TARGET_RECOVERY_ROOT_OUT)/
+ 	cp -f $(recovery_binary) $(TARGET_RECOVERY_ROOT_OUT)/sbin/
++	$(if $(TARGET_RECOVERY_PREBUILT_BUSYBOX),cp -f $(TARGET_RECOVERY_PREBUILT_BUSYBOX) $(TARGET_RECOVERY_ROOT_OUT)/sbin/busybox && chmod 755 $(TARGET_RECOVERY_ROOT_OUT)/sbin/busybox)
++	mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/system/bin && ln -sf ../../sbin/busybox $(TARGET_RECOVERY_ROOT_OUT)/system/bin/sh
+ 	cp -rf $(recovery_resources_common) $(TARGET_RECOVERY_ROOT_OUT)/
+ 	$(foreach item,$(recovery_resources_private), \
+ 	  cp -rf $(item) $(TARGET_RECOVERY_ROOT_OUT)/)
+@@ -681,7 +701,30 @@ $(INSTALLED_RECOVERYIMAGE_TARGET): $(MKBOOTFS) $(MKBOOTIMG) $(MINIGZIP) \
+ 	cat $(INSTALLED_DEFAULT_PROP_TARGET) $(recovery_build_prop) \
+ 	        > $(TARGET_RECOVERY_ROOT_OUT)/default.prop
+ 	$(MKBOOTFS) $(TARGET_RECOVERY_ROOT_OUT) | $(MINIGZIP) > $(recovery_ramdisk)
++
++ifeq ($(BOARD_USES_DUALBOOT_RECOVERY),true)
++$(DUALBOOT_RAMDISK_TARGET): $(MKBOOTFS) $(INSTALLED_RAMDISK_TARGET) $(recovery_ramdisk) $(TARGET_ROOT_OUT)/sbin/bootrec | $(MINIGZIP)
++	@echo ----- Making dual-boot ramdisk with embedded recovery ------
++	rm -rf $(DUALBOOT_ROOT_STAGING)
++	cp -a $(TARGET_ROOT_OUT) $(DUALBOOT_ROOT_STAGING)
++	mv -f $(DUALBOOT_ROOT_STAGING)/init $(DUALBOOT_ROOT_STAGING)/init.android
++	mv -f $(DUALBOOT_ROOT_STAGING)/sbin/bootrec $(DUALBOOT_ROOT_STAGING)/init
++	chmod 750 $(DUALBOOT_ROOT_STAGING)/init
++	ln -sf ../init.android $(DUALBOOT_ROOT_STAGING)/sbin/ueventd
++	cp -f $(recovery_ramdisk) $(DUALBOOT_ROOT_STAGING)/sbin/ramdisk-recovery.img
++	chmod 644 $(DUALBOOT_ROOT_STAGING)/sbin/ramdisk-recovery.img
++	$(hide) $(MKBOOTFS) $(DUALBOOT_ROOT_STAGING) | $(MINIGZIP) > $@
++endif
++
++ifeq ($(BOARD_USES_SONY_ELF_BOOTIMG),true)
++$(INSTALLED_RECOVERYIMAGE_TARGET): $(recovery_ramdisk) $(recovery_kernel) device/sony/mesona/tools/mkelf.py
++	@echo ----- Making Sony ELF recovery image ------
++	$(hide) python device/sony/mesona/tools/mkelf.py --kernel $(recovery_kernel) --ramdisk $(recovery_ramdisk) $(if $(BOARD_KERNEL_CMDLINE),--cmdline "$(BOARD_KERNEL_CMDLINE)") --output $@
++else
++$(INSTALLED_RECOVERYIMAGE_TARGET): $(MKBOOTIMG) $(recovery_ramdisk) $(recovery_kernel) $(INSTALLED_2NDBOOTLOADER_TARGET)
++	@echo ----- Making recovery image ------
+ 	$(MKBOOTIMG) $(INTERNAL_RECOVERYIMAGE_ARGS) --output $@
++endif
+ 	@echo ----- Made recovery image -------- $@
+ 	$(hide) $(call assert-max-image-size,$@,$(BOARD_RECOVERYIMAGE_PARTITION_SIZE),raw)
+ 
+@@ -751,7 +794,7 @@ $(RECOVERY_FROM_BOOT_PATCH): $(INSTALLED_RECOVERYIMAGE_TARGET) \
+ 	                     $(HOST_OUT_EXECUTABLES)/bsdiff
+ 	@echo "Construct recovery from boot"
+ 	mkdir -p $(dir $@)
+-	PATH=$(HOST_OUT_EXECUTABLES):$$PATH $(HOST_OUT_EXECUTABLES)/imgdiff $(INSTALLED_BOOTIMAGE_TARGET) $(INSTALLED_RECOVERYIMAGE_TARGET) $@
++	PATH="$(HOST_OUT_EXECUTABLES):$$PATH" $(HOST_OUT_EXECUTABLES)/imgdiff $(INSTALLED_BOOTIMAGE_TARGET) $(INSTALLED_RECOVERYIMAGE_TARGET) $@
+ endif
+ 
+ 
+@@ -959,7 +1002,7 @@ endif
+ 	@# Components of the boot image
+ 	$(hide) mkdir -p $(zip_root)/BOOT
+ 	$(hide) $(call package_files-copy-root, \
+-		$(TARGET_ROOT_OUT),$(zip_root)/BOOT/RAMDISK)
++		$(if $(filter true,$(BOARD_USES_DUALBOOT_RECOVERY)),$(DUALBOOT_ROOT_STAGING),$(TARGET_ROOT_OUT)),$(zip_root)/BOOT/RAMDISK)
+ ifdef INSTALLED_KERNEL_TARGET
+ 	$(hide) $(ACP) $(INSTALLED_KERNEL_TARGET) $(zip_root)/BOOT/kernel
+ endif
+@@ -975,6 +1018,9 @@ ifdef BOARD_KERNEL_BASE
+ endif
+ ifdef BOARD_KERNEL_PAGESIZE
+ 	$(hide) echo "$(BOARD_KERNEL_PAGESIZE)" > $(zip_root)/BOOT/pagesize
++endif
++ifeq ($(BOARD_USES_SONY_ELF_BOOTIMG),true)
++	$(hide) echo "1" > $(zip_root)/BOOT/sony_elf
+ endif
+ 	$(hide) $(foreach t,$(INSTALLED_RADIOIMAGE_TARGET),\
+ 	            mkdir -p $(zip_root)/RADIO; \
+diff --git a/core/product.mk b/core/product.mk
+index 4a0ee01..435b99e 100644
+--- a/core/product.mk
++++ b/core/product.mk
+@@ -68,6 +68,7 @@ _product_var_list := \
+     PRODUCT_MANUFACTURER \
+     PRODUCT_BRAND \
+     PRODUCT_PROPERTY_OVERRIDES \
++    PRODUCT_BUILD_PROP_OVERRIDES \
+     PRODUCT_CHARACTERISTICS \
+     PRODUCT_COPY_FILES \
+     PRODUCT_OTA_PUBLIC_KEYS \
+diff --git a/core/product_config.mk b/core/product_config.mk
+index 70ac894..bc5b6da 100644
+--- a/core/product_config.mk
++++ b/core/product_config.mk
+@@ -279,6 +279,9 @@ PRODUCT_CONTRIBUTORS_FILE := \
+ PRODUCT_PROPERTY_OVERRIDES := \
+ 	$(strip $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PROPERTY_OVERRIDES))
+ 
++PRODUCT_BUILD_PROP_OVERRIDES := \
++	$(strip $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_BUILD_PROP_OVERRIDES))
++
+ # Should we use the default resources or add any product specific overlays
+ PRODUCT_PACKAGE_OVERLAYS := \
+ 	$(strip $(PRODUCTS.$(INTERNAL_PRODUCT).PRODUCT_PACKAGE_OVERLAYS))
