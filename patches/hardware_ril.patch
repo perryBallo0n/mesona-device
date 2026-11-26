@@ -1,0 +1,134 @@
+diff --git a/reference-ril/atchannel.c b/reference-ril/atchannel.c
+index f878b35..373e99a 100644
+--- a/reference-ril/atchannel.c
++++ b/reference-ril/atchannel.c
+@@ -849,14 +849,15 @@ int at_send_command_singleline (const char *command,
+     err = at_send_command_full (command, SINGLELINE, responsePrefix,
+                                     NULL, 0, pp_outResponse);
+ 
+-    if (err == 0 && pp_outResponse != NULL
+-        && (*pp_outResponse)->success > 0
+-        && (*pp_outResponse)->p_intermediates == NULL
+-    ) {
+-        /* successful command must have an intermediate response */
+-        at_response_free(*pp_outResponse);
+-        *pp_outResponse = NULL;
+-        return AT_ERROR_INVALID_RESPONSE;
++    if (err == 0 && pp_outResponse != NULL && *pp_outResponse != NULL) {
++        if ((*pp_outResponse)->success == 0) {
++            return AT_ERROR_GENERIC;
++        }
++        if ((*pp_outResponse)->p_intermediates == NULL) {
++            at_response_free(*pp_outResponse);
++            *pp_outResponse = NULL;
++            return AT_ERROR_INVALID_RESPONSE;
++        }
+     }
+ 
+     return err;
+@@ -871,14 +872,15 @@ int at_send_command_numeric (const char *command,
+     err = at_send_command_full (command, NUMERIC, NULL,
+                                     NULL, 0, pp_outResponse);
+ 
+-    if (err == 0 && pp_outResponse != NULL
+-        && (*pp_outResponse)->success > 0
+-        && (*pp_outResponse)->p_intermediates == NULL
+-    ) {
+-        /* successful command must have an intermediate response */
+-        at_response_free(*pp_outResponse);
+-        *pp_outResponse = NULL;
+-        return AT_ERROR_INVALID_RESPONSE;
++    if (err == 0 && pp_outResponse != NULL && *pp_outResponse != NULL) {
++        if ((*pp_outResponse)->success == 0) {
++            return AT_ERROR_GENERIC;
++        }
++        if ((*pp_outResponse)->p_intermediates == NULL) {
++            at_response_free(*pp_outResponse);
++            *pp_outResponse = NULL;
++            return AT_ERROR_INVALID_RESPONSE;
++        }
+     }
+ 
+     return err;
+@@ -895,14 +897,15 @@ int at_send_command_sms (const char *command,
+     err = at_send_command_full (command, SINGLELINE, responsePrefix,
+                                     pdu, 0, pp_outResponse);
+ 
+-    if (err == 0 && pp_outResponse != NULL
+-        && (*pp_outResponse)->success > 0
+-        && (*pp_outResponse)->p_intermediates == NULL
+-    ) {
+-        /* successful command must have an intermediate response */
+-        at_response_free(*pp_outResponse);
+-        *pp_outResponse = NULL;
+-        return AT_ERROR_INVALID_RESPONSE;
++    if (err == 0 && pp_outResponse != NULL && *pp_outResponse != NULL) {
++        if ((*pp_outResponse)->success == 0) {
++            return AT_ERROR_GENERIC;
++        }
++        if ((*pp_outResponse)->p_intermediates == NULL) {
++            at_response_free(*pp_outResponse);
++            *pp_outResponse = NULL;
++            return AT_ERROR_INVALID_RESPONSE;
++        }
+     }
+ 
+     return err;
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 633ad8b..25f97f1 100644
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -129,6 +129,7 @@ static int s_repollCallsCount = 0;
+ static int s_expectAnswer = 0;
+ #endif /* WORKAROUND_ERRONEOUS_ANSWER */
+ 
++static int s_sim_poll_retries = 0;
+ static void pollSIMState (void *param);
+ static void setRadioState(RIL_RadioState newState);
+ 
+@@ -495,8 +496,15 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
+ 
+     err = at_send_command_multiline ("AT+CLCC", "+CLCC:", &p_response);
+ 
+-    if (err != 0 || p_response->success == 0) {
+-        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
++    if (err != 0 || p_response == NULL || p_response->success == 0) {
++        at_response_free(p_response);
++        if (sState == RADIO_STATE_OFF || sState == RADIO_STATE_UNAVAILABLE) {
++            RIL_onRequestComplete(t, RIL_E_RADIO_NOT_AVAILABLE, NULL, 0);
++        } else {
++            /* Qualcomm MSM7x27a AT parser returns ERROR to AT+CLCC when SIM is absent/not ready;
++             * returning GENERIC_FAILURE traps GsmCallTracker in a 250ms poll loop holding DATA1 wakelock. */
++            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
++        }
+         return;
+     }
+ 
+@@ -736,7 +744,7 @@ static void requestRegistrationState(int request, void *data,
+ 
+     err = at_send_command_singleline(cmd, prefix, &p_response);
+ 
+-    if (err != 0) goto error;
++    if (err != 0 || p_response == NULL || p_response->success == 0 || p_response->p_intermediates == NULL) goto error;
+ 
+     line = p_response->p_intermediates->line;
+ 
+@@ -1567,6 +1575,7 @@ setRadioState(RIL_RadioState newState)
+         if (sState == RADIO_STATE_SIM_READY) {
+             onSIMReady();
+         } else if (sState == RADIO_STATE_SIM_NOT_READY) {
++            s_sim_poll_retries = 0;
+             onRadioPowerOn();
+         }
+     }
+@@ -1751,6 +1760,10 @@ static void pollSIMState (void *param)
+         return;
+ 
+         case SIM_NOT_READY:
++            if (++s_sim_poll_retries >= 15) {
++                setRadioState(RADIO_STATE_SIM_LOCKED_OR_ABSENT);
++                return;
++            }
+             RIL_requestTimedCallback (pollSIMState, NULL, &TIMEVAL_SIMPOLL);
+         return;
+ 
