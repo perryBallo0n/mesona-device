@@ -86,3 +86,6 @@ PRODUCT_COPY_FILES +=     device/common/gps/gps.conf_US_SUPL:system/etc/gps.conf
 # Root & Superuser
 PRODUCT_PACKAGES += su Superuser
 PRODUCT_PACKAGES += bootrec
+
+# ZRAM 128 MB init script
+PRODUCT_COPY_FILES += device/sony/mesona/prebuilt/init_zram.sh:system/etc/init_zram.sh

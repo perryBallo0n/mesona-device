@@ -17,3 +17,6 @@ PRODUCT_COPY_FILES += \
 
 PRODUCT_RELEASE_NAME := XperiaMiro-ST23i
 -include vendor/cyanogen/products/common_versions.mk
+
+BUILD_DATE_ID := $(shell date +%Y%m%d)
+PRODUCT_BUILD_PROP_OVERRIDES += BUILD_DISPLAY_ID=$(BUILD_DATE_ID) BUILD_NUMBER=$(BUILD_DATE_ID)

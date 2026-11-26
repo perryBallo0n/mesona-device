@@ -382,6 +382,10 @@ struct msm_vfe_cfg_cmd {
 
 static void init_real_libc();
 static bool g_v4l2_streaming = false;
+static pthread_mutex_t g_v4l2_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile bool g_snapshot_in_progress = false;
+static void stop_v4l2_streaming_locked();
+static int start_v4l2_streaming_locked(int fd, int w, int h);
 static enum v4l2_memory g_v4l2_memory_type = V4L2_MEMORY_USERPTR;
 static int g_v4l2_preview_w = 640;
 static int g_v4l2_preview_h = 480;
@@ -480,6 +484,12 @@ static void free_v4l2_cap_pool() {
 }
 
 static void stop_v4l2_streaming() {
+    pthread_mutex_lock(&g_v4l2_mutex);
+    stop_v4l2_streaming_locked();
+    pthread_mutex_unlock(&g_v4l2_mutex);
+}
+
+static void stop_v4l2_streaming_locked() {
     if (!g_v4l2_streaming) return;
     init_real_libc();
     s_v4l2_fail_count = 0;
@@ -593,6 +603,16 @@ static int send_vfe_general_cmd_retry(int conf_fd, uint32_t id, void *val, uint1
 }
 
 static int start_v4l2_streaming(int fd, int w, int h) {
+    pthread_mutex_lock(&g_v4l2_mutex);
+    int rc = -1;
+    if (!g_snapshot_in_progress) {
+        rc = start_v4l2_streaming_locked(fd, w, h);
+    }
+    pthread_mutex_unlock(&g_v4l2_mutex);
+    return rc;
+}
+
+static int start_v4l2_streaming_locked(int fd, int w, int h) {
     if (g_v4l2_streaming) return 0;
     if (fd < 0) return -1;
     init_real_libc();
@@ -1102,18 +1122,19 @@ static int my_hooked_ioctl(int fd, int request, ...) {
             int idx = g_frame_index % max_bufs;
             g_frame_index = (idx + 1) % max_bufs;
 
-            if (!g_v4l2_streaming && g_frame_fd >= 0) {
-                start_v4l2_streaming(g_frame_fd, g_shim_preview_w, g_shim_preview_h);
-            }
-
             bool got_real_frame = false;
-            if (g_v4l2_streaming && g_frame_fd >= 0) {
+            if (!g_snapshot_in_progress && g_frame_fd >= 0) {
+                pthread_mutex_lock(&g_v4l2_mutex);
+                if (!g_snapshot_in_progress && !g_v4l2_streaming) {
+                    start_v4l2_streaming_locked(g_frame_fd, g_shim_preview_w, g_shim_preview_h);
+                }
+                if (!g_snapshot_in_progress && g_v4l2_streaming) {
                 struct v4l2_buffer vbuf;
                 memset(&vbuf, 0, sizeof(vbuf));
                 vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
                 vbuf.memory = g_v4l2_memory_type;
                 int dq_rc = -1;
-                for (int r = 0; r < 60 && g_preview_active; r++) {
+                for (int r = 0; r < 60 && g_preview_active && !g_snapshot_in_progress; r++) {
                     errno = 0;
                     dq_rc = g_orig_ioctl(g_frame_fd, VIDIOC_DQBUF, &vbuf);
                     if (dq_rc == 0 || (errno != EAGAIN && errno != EINTR)) {
@@ -1228,6 +1249,8 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                         disk_log("VIDIOC_DQBUF failed on fd=%d: rc=%d, errno=%d (%s)", g_frame_fd, dq_rc, errno, strerror(errno));
                     }
                 }
+                }
+                pthread_mutex_unlock(&g_v4l2_mutex);
             }
 
             memset(f, 0, sizeof(*f));
@@ -1536,8 +1559,8 @@ static int my_hooked_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set 
     }
 
     if (is_frame_wait) {
-        if (!g_preview_active) {
-            usleep(33000);
+        if (!g_preview_active || g_snapshot_in_progress) {
+            usleep(25000);
             FD_ZERO(readfds);
             if (writefds) FD_ZERO(writefds);
             if (exceptfds) FD_ZERO(exceptfds);
@@ -2344,6 +2367,369 @@ static int kernel_cfg_get_i8(int cfgtype, int8_t* out_val) {
     return rc;
 }
 
+static bool capture_highres_snapshot(int req_w, int req_h, uint8_t** out_nv21, int* out_w, int* out_h) {
+    if (!out_nv21 || !out_w || !out_h || g_frame_fd < 0 || g_config_fd < 0 || !g_orig_ioctl) {
+        return false;
+    }
+    *out_nv21 = NULL;
+    *out_w = 0;
+    *out_h = 0;
+
+    /* Native RES_PREVIEW from isx006 is 1280x960 (safe within pmem_adsp and VFE preview path) */
+    const int in_w = 1280;
+    const int in_h = 960;
+    int target_w = req_w;
+    int target_h = req_h;
+    if (target_w > in_w) target_w = in_w;
+    if (target_h > in_h) target_h = in_h;
+    target_w &= ~15;
+    target_h &= ~15;
+    if (target_w < 320 || target_h < 240) {
+        target_w = in_w;
+        target_h = in_h;
+    }
+
+    disk_log("capture_highres_snapshot: req=%dx%d -> sensor_in=%dx%d (RES_PREVIEW), out=%dx%d",
+             req_w, req_h, in_w, in_h, target_w, target_h);
+
+    g_snapshot_in_progress = true;
+    pthread_mutex_lock(&g_v4l2_mutex);
+    stop_v4l2_streaming_locked();
+    usleep(30000);
+
+    int snap_fd = -1;
+    void* snap_base = NULL;
+    size_t snap_buf_sz = ((size_t)target_w * target_h * 3 / 2 + 4095) & ~4095;
+    const int SNAP_BUFS = 4; /* >= 3 buffers required so VFE AXI ping/pong/free_buf all have valid paddr */
+    size_t snap_total = snap_buf_sz * SNAP_BUFS;
+    bool reqbufs_done = false;
+    bool stream_started = false;
+    bool vfe_started = false;
+    bool got_frame = false;
+    uint8_t* result_buf = NULL;
+
+    uint32_t vfe_output_mode = 0x40; /* VFE_OUTPUTS_PREVIEW */
+    g_orig_ioctl(g_config_fd, 0x40046d32, &vfe_output_mode);
+    if (g_frame_fd != g_config_fd) {
+        g_orig_ioctl(g_frame_fd, 0x40046d32, &vfe_output_mode);
+    }
+
+    struct v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.extendedmode = 1;
+    g_orig_ioctl(g_frame_fd, VIDIOC_S_PARM, &parm);
+
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = target_w;
+    fmt.fmt.pix.height = target_h;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV21;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (g_orig_ioctl(g_frame_fd, VIDIOC_S_FMT, &fmt) < 0) {
+        disk_log("capture_highres_snapshot: VIDIOC_S_FMT(%dx%d) failed: %s", target_w, target_h, strerror(errno));
+        goto cleanup;
+    }
+    target_w = fmt.fmt.pix.width;
+    target_h = fmt.fmt.pix.height;
+    snap_buf_sz = ((size_t)target_w * target_h * 3 / 2 + 4095) & ~4095;
+    snap_total = snap_buf_sz * SNAP_BUFS;
+
+    snap_fd = g_orig_open ? g_orig_open("/dev/pmem_adsp", O_RDWR, 0) : open("/dev/pmem_adsp", O_RDWR, 0);
+    if (snap_fd < 0) {
+        disk_log("capture_highres_snapshot: open(/dev/pmem_adsp) failed: %s", strerror(errno));
+        goto cleanup;
+    }
+    snap_base = mmap(NULL, snap_total, PROT_READ | PROT_WRITE, MAP_SHARED, snap_fd, 0);
+    if (snap_base == MAP_FAILED) {
+        disk_log("capture_highres_snapshot: mmap(%zu bytes) failed: %s", snap_total, strerror(errno));
+        snap_base = NULL;
+        goto cleanup;
+    }
+
+    {
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count = SNAP_BUFS;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_USERPTR;
+        if (g_orig_ioctl(g_frame_fd, VIDIOC_REQBUFS, &req) != 0 || req.count == 0) {
+            disk_log("capture_highres_snapshot: VIDIOC_REQBUFS(USERPTR) failed: %s", strerror(errno));
+            goto cleanup;
+        }
+        reqbufs_done = true;
+        unsigned int nq = req.count < (unsigned int)SNAP_BUFS ? req.count : (unsigned int)SNAP_BUFS;
+        for (unsigned int i = 0; i < nq; i++) {
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_USERPTR;
+            buf.index = i;
+            buf.m.userptr = (unsigned long)snap_fd;
+            buf.reserved = (size_t)i * snap_buf_sz;
+            buf.length = snap_buf_sz;
+            if (g_orig_ioctl(g_frame_fd, VIDIOC_QBUF, &buf) != 0) {
+                disk_log("capture_highres_snapshot: QBUF(%u) failed: %s", i, strerror(errno));
+                goto cleanup;
+            }
+        }
+    }
+
+    {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (g_orig_ioctl(g_frame_fd, VIDIOC_STREAMON, &type) < 0) {
+            disk_log("capture_highres_snapshot: VIDIOC_STREAMON failed: %s", strerror(errno));
+            goto cleanup;
+        }
+        stream_started = true;
+    }
+
+    {
+        subscribe_config_events(g_config_fd);
+        int rst = send_vfe_general_cmd_retry(g_config_fd, 2, NULL, 0, "SNAP_VFE_RESET");
+        if (rst == 0) {
+            usleep(20000);
+            drain_config_events(g_config_fd, "snap_RESET", 50);
+        }
+
+        uint32_t camif_buf[8];
+        memset(camif_buf, 0, sizeof(camif_buf));
+        uint32_t yuv_clks = (uint32_t)(in_w * 2);
+        camif_buf[0] = 0x0100;
+        camif_buf[1] = 0;
+        camif_buf[2] = yuv_clks | ((uint32_t)in_h << 14);
+        camif_buf[3] = yuv_clks - 1;
+        camif_buf[4] = (uint32_t)(in_h - 1);
+        camif_buf[5] = 0xffffffff;
+        camif_buf[6] = 0x00000000;
+        camif_buf[7] = 0x0fffffff;
+        send_vfe_general_cmd_retry(g_config_fd, 7, camif_buf, sizeof(camif_buf), "SNAP_CAMIF");
+
+        uint32_t demux_buf[3] = { 0x0e, 0x00800080, 0x00800080 };
+        send_vfe_general_cmd_retry(g_config_fd, 11, demux_buf, sizeof(demux_buf), "SNAP_DEMUX");
+
+        uint32_t skip_buf[2] = { 0x3fffffff, 0x3fffffff };
+        send_vfe_general_cmd_retry(g_config_fd, 27, skip_buf, sizeof(skip_buf), "SNAP_SKIP");
+
+        uint32_t active_buf[2] = { yuv_clks - 1, (uint32_t)(in_h - 1) };
+        send_vfe_general_cmd_retry(g_config_fd, 129, active_buf, sizeof(active_buf), "SNAP_ACTIVE");
+
+        uint32_t fov_buf[2] = { (uint32_t)(in_w - 1), (uint32_t)(in_h - 1) };
+        send_vfe_general_cmd_retry(g_config_fd, 12, fov_buf, sizeof(fov_buf), "SNAP_FOV");
+
+        uint32_t chroma_subs = 0x01;
+        send_vfe_general_cmd_retry(g_config_fd, 25, &chroma_subs, sizeof(chroma_subs), "SNAP_CHROMA");
+
+        uint32_t clamp_buf[2] = { 0x00ffffff, 0x00000000 };
+        send_vfe_general_cmd_retry(g_config_fd, 26, clamp_buf, sizeof(clamp_buf), "SNAP_CLAMP");
+
+        struct {
+            uint32_t input_source:1;
+            uint32_t mode_of_operation:1;
+            uint32_t snap_number:4;
+            uint32_t reserved1:26;
+            uint32_t modules_enable;
+            uint32_t last_pixel:12;
+            uint32_t reserved2:4;
+            uint32_t last_line:12;
+            uint32_t reserved3:4;
+        } start_cmd;
+        memset(&start_cmd, 0, sizeof(start_cmd));
+        start_cmd.input_source = 0;
+        start_cmd.mode_of_operation = 0;
+        start_cmd.snap_number = 8;
+        start_cmd.modules_enable = 0x40;
+        start_cmd.last_pixel = (uint32_t)(in_w - 1);
+        start_cmd.last_line = (uint32_t)(in_h - 1);
+        int op_rc = send_vfe_general_cmd_retry(g_config_fd, 5, &start_cmd, sizeof(start_cmd), "SNAP_OP");
+
+        static const int16_t poly_coeffs[64] = {
+            0x000, 0x06f, 0x132, 0x05f, 0x001, 0x07f, 0x12f, 0x051,
+            0x002, 0x090, 0x12a, 0x044, 0x004, 0x0a1, 0x124, 0x037,
+            0x006, 0x0b3, 0x11b, 0x02c, 0x008, 0x0c4, 0x110, 0x024,
+            0x00c, 05, 0x103, 0x01c, 0x010, 0x0e5, 0x0f5, 0x016,
+            0x015, 0x0f5, 0x0e5, 0x011, 0x01c, 0x103, 05, 0x00c,
+            0x024, 0x110, 0x0c4, 0x008, 0x02d, 0x11b, 0x0b3, 0x005,
+            0x038, 0x124, 0x0a1, 0x003, 0x044, 0x12a, 0x090, 0x002,
+            0x051, 0x12f, 0x07f, 0x001, 0x05f, 0x132, 0x06f, 0x000
+        };
+        uint32_t scale2_buf[72];
+        memset(scale2_buf, 0, sizeof(scale2_buf));
+        uint32_t dim_in = ((uint32_t)in_h << 16) | (uint32_t)in_w;
+        uint32_t dim_out = ((uint32_t)target_h << 16) | (uint32_t)target_w;
+        bool need_scale = (in_w != target_w || in_h != target_h);
+        scale2_buf[0] = need_scale ? 0x00ca : 0x0000;
+        scale2_buf[1] = dim_in;
+        scale2_buf[2] = dim_out;
+        scale2_buf[3] = dim_in;
+        scale2_buf[4] = (((uint32_t)(target_h / 2)) << 16) | (uint32_t)(target_w / 2);
+        scale2_buf[5] = 0;
+        scale2_buf[6] = 0x80000000u | dim_out;
+        scale2_buf[7] = dim_out;
+        for (int i = 0; i < 16; i++) {
+            int16_t c0 = poly_coeffs[i * 4 + 0];
+            int16_t c1 = poly_coeffs[i * 4 + 1];
+            int16_t c2 = poly_coeffs[i * 4 + 2];
+            int16_t c3 = poly_coeffs[i * 4 + 3];
+            uint32_t w0 = (uint32_t)((c0 >> 2) & 0xff);
+            uint32_t w1 = ((uint32_t)(c3 & 0x3ff)) |
+                          (((uint32_t)(c2 & 0x3ff)) << 10) |
+                          (((uint32_t)(c1 & 0x3ff)) << 20) |
+                          (((uint32_t)(c0 & 0x3)) << 30);
+            scale2_buf[8 + i * 2]      = w0;
+            scale2_buf[8 + i * 2 + 1]  = w1;
+            scale2_buf[40 + i * 2]     = w0;
+            scale2_buf[40 + i * 2 + 1] = w1;
+        }
+        send_vfe_general_cmd_retry(g_config_fd, 135, scale2_buf, sizeof(scale2_buf), "SNAP_SCALE2");
+
+        uint32_t axiout_buf[42];
+        memset(axiout_buf, 0, sizeof(axiout_buf));
+        int width_words = (target_w + 7) / 8;
+        int h_y = target_h;
+        int h_cbcr = (target_h + 1) / 2;
+        uint32_t part1_y = ((width_words & 0x3ff) << 16) | (h_y & 0xfff);
+        uint32_t part2_y = ((width_words & 0xfff) << 14) | ((h_y & 0xfff) << 2) | 1;
+        uint32_t part1_cbcr = ((width_words & 0x3ff) << 16) | (h_cbcr & 0xfff);
+        uint32_t part2_cbcr = ((width_words & 0xfff) << 14) | ((h_cbcr & 0xfff) << 2) | 1;
+        axiout_buf[0] = 1;
+        axiout_buf[1] = part1_y;
+        axiout_buf[2] = part2_y;
+        axiout_buf[3] = part1_cbcr;
+        axiout_buf[4] = part2_cbcr;
+        axiout_buf[5] = part1_y;
+        axiout_buf[6] = part2_y;
+        axiout_buf[7] = part1_cbcr;
+        axiout_buf[8] = part2_cbcr;
+
+        struct msm_isp_cmd axi_isp_cmd;
+        memset(&axi_isp_cmd, 0, sizeof(axi_isp_cmd));
+        axi_isp_cmd.id = 6;
+        axi_isp_cmd.length = 164;
+        axi_isp_cmd.value = axiout_buf;
+
+        struct msm_vfe_cfg_cmd axi_cfg;
+        memset(&axi_cfg, 0, sizeof(axi_cfg));
+        axi_cfg.cmd_type = 0x100;
+        axi_cfg.length = sizeof(axi_isp_cmd);
+        axi_cfg.value = &axi_isp_cmd;
+        int axi_rc = g_orig_ioctl(g_config_fd, 0x40046d10, &axi_cfg);
+        usleep(30000);
+        int start_rc = send_vfe_general_cmd_retry(g_config_fd, 3, &start_cmd, sizeof(start_cmd), "SNAP_START");
+        drain_config_events(g_config_fd, "snap_START", 200);
+        disk_log("capture_highres_snapshot: VFE start op=%d axi=%d start=%d", op_rc, axi_rc, start_rc);
+        if (op_rc != 0 || axi_rc != 0 || start_rc != 0) {
+            if (start_rc == 0) vfe_started = true;
+            goto cleanup;
+        }
+        vfe_started = true;
+    }
+
+    {
+        size_t nv21_bytes = (size_t)target_w * target_h * 3 / 2;
+        result_buf = (uint8_t*)malloc(nv21_bytes);
+        if (!result_buf) goto cleanup;
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            struct v4l2_buffer vbuf;
+            memset(&vbuf, 0, sizeof(vbuf));
+            vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            vbuf.memory = V4L2_MEMORY_USERPTR;
+            int dq_rc = -1;
+            int timeout_ms = (attempt == 0) ? 1800 : 800;
+            int64_t t0 = now_monotonic_ns();
+            while ((now_monotonic_ns() - t0) < (int64_t)timeout_ms * 1000000LL) {
+                errno = 0;
+                dq_rc = g_orig_ioctl(g_frame_fd, VIDIOC_DQBUF, &vbuf);
+                if (dq_rc == 0 || (errno != EAGAIN && errno != EINTR)) {
+                    break;
+                }
+                usleep(5000);
+            }
+            disk_log("capture_highres_snapshot: DQBUF attempt=%d rc=%d errno=%d idx=%u",
+                     attempt, dq_rc, errno, vbuf.index);
+            if (dq_rc != 0 || vbuf.index >= (unsigned int)SNAP_BUFS) {
+                break;
+            }
+            size_t off = (size_t)vbuf.index * snap_buf_sz;
+            void* src_ptr = (char*)snap_base + off;
+            struct { unsigned long vaddr; unsigned long offset; unsigned long length; } pm = {
+                (unsigned long)src_ptr, (unsigned long)off, (unsigned long)nv21_bytes
+            };
+            g_orig_ioctl(snap_fd, 0x4004700d /* PMEM_INV_CACHES */, &pm);
+
+            const uint8_t* bytes = (const uint8_t*)src_ptr;
+            uint32_t sample_sum = 0;
+            size_t step = nv21_bytes / 64;
+            if (step == 0) step = 1;
+            for (size_t k = 0; k < nv21_bytes; k += step) {
+                sample_sum += bytes[k];
+            }
+            if (sample_sum > 0) {
+                memcpy(result_buf, src_ptr, nv21_bytes);
+                got_frame = true;
+            }
+            disk_log("capture_highres_snapshot: attempt=%d sample_sum=%u", attempt, sample_sum);
+
+            vbuf.m.userptr = (unsigned long)snap_fd;
+            vbuf.reserved = off;
+            vbuf.length = snap_buf_sz;
+            g_orig_ioctl(g_frame_fd, VIDIOC_QBUF, &vbuf);
+            if (got_frame) {
+                break;
+            }
+        }
+    }
+
+cleanup:
+    if (vfe_started && g_config_fd >= 0) {
+        struct msm_isp_cmd stop_isp_cmd;
+        memset(&stop_isp_cmd, 0, sizeof(stop_isp_cmd));
+        stop_isp_cmd.id = 65; /* VFE_CMD_STOP */
+        struct msm_vfe_cfg_cmd stop_cfg;
+        memset(&stop_cfg, 0, sizeof(stop_cfg));
+        stop_cfg.cmd_type = 0;
+        stop_cfg.length = sizeof(stop_isp_cmd);
+        stop_cfg.value = &stop_isp_cmd;
+        g_orig_ioctl(g_config_fd, 0x40046d05, &stop_cfg);
+    }
+    if (stream_started && g_frame_fd >= 0) {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        g_orig_ioctl(g_frame_fd, VIDIOC_STREAMOFF, &type);
+    }
+    if (reqbufs_done && g_frame_fd >= 0) {
+        struct v4l2_requestbuffers req;
+        memset(&req, 0, sizeof(req));
+        req.count = 0;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_USERPTR;
+        g_orig_ioctl(g_frame_fd, VIDIOC_REQBUFS, &req);
+    }
+    if (snap_base) {
+        munmap(snap_base, snap_total);
+    }
+    if (snap_fd >= 0) {
+        close(snap_fd);
+    }
+    if (g_frame_fd >= 0 && (g_hal_preview_started || g_preview_active)) {
+        start_v4l2_streaming_locked(g_frame_fd, g_shim_preview_w, g_shim_preview_h);
+    }
+    g_snapshot_in_progress = false;
+    pthread_mutex_unlock(&g_v4l2_mutex);
+
+    if (got_frame && result_buf) {
+        *out_nv21 = result_buf;
+        *out_w = target_w;
+        *out_h = target_h;
+        return true;
+    }
+    if (result_buf) {
+        free(result_buf);
+    }
+    return false;
+}
+
 struct StrIntMap {
     const char* key;
     int val;
@@ -2933,6 +3319,10 @@ public:
     int m_ev_val;
     int m_led_mode;
     int m_rotation;
+    int m_jpeg_quality;
+    int m_picture_w;
+    int m_picture_h;
+    String8 m_touch_af_aec;
     FocusModeKind m_focus_kind;
     bool m_has_focus_roi;
     bool m_roi_dirty;
@@ -2968,6 +3358,25 @@ public:
         if (w <= 0 || (l == 0 && t == 0 && r == 0 && b == 0)) return false;
         int cx = (l + r) / 2 + 1000;
         int cy = (t + b) / 2 + 1000;
+        if (cx < 0) cx = 0; if (cx > 2000) cx = 2000;
+        if (cy < 0) cy = 0; if (cy > 2000) cy = 2000;
+        int ratio = (prev_h > 0) ? (prev_w * 1000 / prev_h) : 1333;
+        roi[0] = (uint16_t)cx;
+        roi[1] = (uint16_t)cy;
+        roi[2] = 0;
+        roi[3] = 0;
+        roi[4] = (uint16_t)ratio;
+        roi[5] = 1;
+        return true;
+    }
+
+    static bool parse_touch_index_af(const char* pt_str, int prev_w, int prev_h, uint16_t roi[6]) {
+        if (!pt_str || pt_str[0] == '\0' || prev_w <= 0 || prev_h <= 0) return false;
+        int x = -1, y = -1;
+        if (sscanf(pt_str, "%d , %d", &x, &y) != 2) return false;
+        if (x < 0 || y < 0) return false;
+        int cx = (x * 2000) / prev_w;
+        int cy = (y * 2000) / prev_h;
         if (cx < 0) cx = 0; if (cx > 2000) cx = 2000;
         if (cy < 0) cy = 0; if (cy > 2000) cy = 2000;
         int ratio = (prev_h > 0) ? (prev_w * 1000 / prev_h) : 1333;
@@ -3063,6 +3472,10 @@ public:
         m_ev_val(0),
         m_led_mode(K_LED_MODE_OFF),
         m_rotation(0),
+        m_jpeg_quality(92),
+        m_picture_w(2592),
+        m_picture_h(1944),
+        m_touch_af_aec("touch-off"),
         m_focus_kind(FOCUS_AUTO),
         m_has_focus_roi(false),
         m_roi_dirty(false),
@@ -3429,7 +3842,7 @@ public:
             self->m_notify_cb(CAMERA_MSG_SHUTTER, 0, 0, self->m_user);
         }
 
-        // 2. Identify the NV21 frame to capture (copy under lock to avoid tearing)
+        // 2. Always keep a safe backup of the latest preview sensor frame first
         int w = 0, h = 0;
         uint8_t* nv21_copy = NULL;
         const uint8_t* nv21_src = NULL;
@@ -3444,9 +3857,28 @@ public:
                 apply_neg_ev_y_plane(nv21_copy, (size_t)w * h);
                 nv21_src = nv21_copy;
             }
-            disk_log("snapshot_thread: using real sensor frame (%dx%d)!", w, h);
         }
         pthread_mutex_unlock(&g_sensor_frame_mutex);
+
+        int req_pw = self->m_picture_w > 0 ? self->m_picture_w : 2592;
+        int req_ph = self->m_picture_h > 0 ? self->m_picture_h : 1944;
+        uint8_t* hi_nv21 = NULL;
+        int hi_w = 0, hi_h = 0;
+        if (req_pw > 640 || req_ph > 480) {
+            if (capture_highres_snapshot(req_pw, req_ph, &hi_nv21, &hi_w, &hi_h) && hi_nv21) {
+                apply_neg_ev_y_plane(hi_nv21, (size_t)hi_w * hi_h);
+                if (nv21_copy) {
+                    free(nv21_copy);
+                }
+                nv21_copy = hi_nv21;
+                nv21_src = nv21_copy;
+                w = hi_w;
+                h = hi_h;
+                disk_log("snapshot_thread: using HIGHRES frame (%dx%d)!", w, h);
+            } else {
+                disk_log("snapshot_thread: highres failed/skipped, using preview fallback (%dx%d)", w, h);
+            }
+        }
 
         if (fire_flash) {
             kernel_flash_ctrl(led_mode, (led_mode == K_LED_MODE_TORCH) ? K_LED_STATE_HIGH : K_LED_STATE_OFF);
@@ -3467,6 +3899,22 @@ public:
             }
         }
 
+        // Downscale if caller explicitly asked for a smaller picture size than the captured frame
+        uint8_t* scaled_copy = NULL;
+        if (nv21_src && req_pw > 0 && req_ph > 0 && (req_pw < w || req_ph < h) && !(req_pw > 640 && w <= 640)) {
+            int dw = req_pw & ~1;
+            int dh = req_ph & ~1;
+            if (dw >= 160 && dh >= 120) {
+                scaled_copy = (uint8_t*)malloc((size_t)dw * dh * 3 / 2);
+                if (scaled_copy) {
+                    scale_nv21(nv21_src, w, h, scaled_copy, dw, dh);
+                    nv21_src = scaled_copy;
+                    w = dw;
+                    h = dh;
+                }
+            }
+        }
+
         // NOTE: CAMERA_MSG_RAW_IMAGE is intentionally omitted because CameraService::Client::handleRawPicture
         // calls mSurface->postBuffer(), which crashes/hangs when the buffer is not from getPreviewHeap().
 
@@ -3475,9 +3923,12 @@ public:
             size_t max_jpeg_sz = (size_t)w * h * 2;
             uint8_t* jpeg_out = (uint8_t*)malloc(max_jpeg_sz);
             size_t jpeg_sz = 0;
+            int q = self->m_jpeg_quality;
+            if (q < 1) q = 1;
+            if (q > 100) q = 100;
             if (jpeg_out) {
-                int ret = compress_nv21_to_jpeg(nv21_src, w, h, 85, self->m_rotation, jpeg_out, max_jpeg_sz, &jpeg_sz);
-                disk_log("snapshot_thread: compressed NV21 (%dx%d, rot=%d) to JPEG: ret=%d, size=%zu", w, h, self->m_rotation, ret, jpeg_sz);
+                int ret = compress_nv21_to_jpeg(nv21_src, w, h, q, self->m_rotation, jpeg_out, max_jpeg_sz, &jpeg_sz);
+                disk_log("snapshot_thread: compressed NV21 (%dx%d, rot=%d, q=%d) to JPEG: ret=%d, size=%zu", w, h, self->m_rotation, q, ret, jpeg_sz);
                 if (ret == 0 && jpeg_sz > 0 && self->m_data_cb) {
                     sp<MemoryHeapBase> heap = new MemoryHeapBase(jpeg_sz, 0, "cam_jpeg");
                     if (heap->getBase()) {
@@ -3491,6 +3942,9 @@ public:
             }
         } else {
             disk_log("snapshot_thread: ERROR - no nv21_src buffer found!");
+        }
+        if (scaled_copy) {
+            free(scaled_copy);
         }
         if (nv21_copy) {
             free(nv21_copy);
@@ -3556,6 +4010,9 @@ public:
         const char* p_ev    = params.get(CameraParameters::KEY_EXPOSURE_COMPENSATION);
         const char* p_meter = params.get("auto-exposure");
         const char* p_areas = params.get("focus-areas");
+        const char* p_touch_aec = params.get("touch-af-aec");
+        const char* p_touch_idx = params.get("touch-index-af");
+        const char* p_qual  = params.get(CameraParameters::KEY_JPEG_QUALITY);
         const char* p_rot   = params.get(CameraParameters::KEY_ROTATION);
 
         disk_log("QcomCameraAdapter::setParameters ENTER: prev=%s pic=%s focus=%s flash=%s wb=%s ev=%s scene=%s",
@@ -3594,9 +4051,28 @@ public:
         if (p_meter && map_lookup(kMeterMap, sizeof(kMeterMap)/sizeof(kMeterMap[0]), p_meter, -1) >= 0) {
             m_meter_str = p_meter;
         }
+        int pic_w = 0, pic_h = 0;
+        params.getPictureSize(&pic_w, &pic_h);
+        if (pic_w > 0 && pic_h > 0) {
+            m_picture_w = pic_w;
+            m_picture_h = pic_h;
+        }
+        if (p_qual) {
+            int q = atoi(p_qual);
+            if (q >= 1 && q <= 100) {
+                m_jpeg_quality = q;
+            }
+        }
+        if (p_touch_aec) {
+            m_touch_af_aec = p_touch_aec;
+        }
         int pw = 640, ph = 480;
         params.getPreviewSize(&pw, &ph);
-        if (parse_focus_area(p_areas, pw, ph, m_focus_roi)) {
+        if (p_touch_aec && strcmp(p_touch_aec, "touch-off") == 0) {
+            m_has_focus_roi = false;
+        } else if (parse_focus_area(p_areas, pw, ph, m_focus_roi)) {
+            m_has_focus_roi = true;
+        } else if (parse_touch_index_af(p_touch_idx, pw, ph, m_focus_roi)) {
             m_has_focus_roi = true;
         } else {
             m_has_focus_roi = false;
@@ -3702,6 +4178,12 @@ public:
 
         params.set("auto-exposure-values", "frame-average,center-weighted,spot-metering");
         params.set("auto-exposure", m_meter_str.string());
+        params.set("touch-af-aec-values", "touch-off,touch-on");
+        params.set("touch-af-aec", m_touch_af_aec.string());
+        params.set("max-num-focus-areas", "1");
+        char qual_buf[16];
+        snprintf(qual_buf, sizeof(qual_buf), "%d", m_jpeg_quality);
+        params.set(CameraParameters::KEY_JPEG_QUALITY, qual_buf);
         char rot_buf[16];
         snprintf(rot_buf, sizeof(rot_buf), "%d", m_rotation);
         params.set(CameraParameters::KEY_ROTATION, rot_buf);

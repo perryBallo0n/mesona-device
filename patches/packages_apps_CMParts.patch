@@ -1,3 +1,347 @@
+diff --git a/AndroidManifest.xml b/AndroidManifest.xml
+index d37cbed..e696b8d 100644
+--- a/AndroidManifest.xml
++++ b/AndroidManifest.xml
+@@ -76,6 +76,13 @@
+                 <category android:name="com.cyanogenmod.cmparts.SHORTCUT" />
+             </intent-filter>
+         </activity>
++        <activity android:name=".activities.BottomLedActivity"
++            android:label="@string/bottom_led_title">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="com.cyanogenmod.cmparts.SHORTCUT" />
++            </intent-filter>
++        </activity>
+         <activity android:name=".activities.led.NotificationActivity"
+             android:label="@string/trackball_title">
+             <intent-filter>
+diff --git a/res/values-ru/arrays.xml b/res/values-ru/arrays.xml
+index f15cd89..7504a5e 100644
+--- a/res/values-ru/arrays.xml
++++ b/res/values-ru/arrays.xml
+@@ -244,4 +244,16 @@
+         <item>Вкл.</item>
+     </string-array>
+ 
++    <string-array name="entries_bottom_led_brightness" translatable="false">
++        <item>50% (Тускло)</item>
++        <item>75%</item>
++        <item>100% (По умолчанию)</item>
++        <item>130% (Ярко)</item>
++    </string-array>
++    <string-array name="values_bottom_led_brightness" translatable="false">
++        <item>50</item>
++        <item>75</item>
++        <item>100</item>
++        <item>130</item>
++    </string-array>
+ </resources>
+diff --git a/res/values-ru/strings.xml b/res/values-ru/strings.xml
+index 67f7bde..464c9c1 100644
+--- a/res/values-ru/strings.xml
++++ b/res/values-ru/strings.xml
+@@ -817,4 +817,23 @@
+     <string name="perm_enable_warning_message">Внимание!\nОтмена большинства разрешений может стать причиной сбоев в работе приложений. Если приложение с отменёнными разрешениями выдаёт ошибку, пожалуйста, предоставьте необходимые разрешения или не используйте приложение.\nПожалуйста, не посылайте сообщения об ошибках в CyanogenMod если приложение с отменёнными разрешениями не работает, как и следовало ожидать!</string>
+     <string name="perm_enable_warning_title">Вы уверены?</string>
+ 
++    <!-- Bottom LED Bar -->
++    <string name="bottom_led_title">Нижняя LED-панель</string>
++    <string name="bottom_led_summary">Подсветка блокировки, музыки и уведомлений</string>
++    <string name="bottom_led_enabled_title">Включить нижнюю LED-панель</string>
++    <string name="bottom_led_enabled_summary">Общий выключатель нижней RGB-подсветки</string>
++    <string name="bottom_led_cat_behavior">Поведение</string>
++    <string name="bottom_led_lockscreen_title">Свечение на экране блокировки</string>
++    <string name="bottom_led_lockscreen_summary">Плавный цвет уровня заряда на экране блокировки</string>
++    <string name="bottom_led_music_title">Цвет обложки трека</string>
++    <string name="bottom_led_music_summary">Окрашивать панель в цвет обложки во время музыки</string>
++    <string name="bottom_led_music_pulse_title">Пульсация при музыке</string>
++    <string name="bottom_led_music_pulse_summary">Плавное аппаратное дыхание во время воспроизведения</string>
++    <string name="bottom_led_notif_title">Индикация уведомлений</string>
++    <string name="bottom_led_notif_summary">Плавное жёлто-оранжевое дыхание при уведомлении (до включения экрана)</string>
++    <string name="bottom_led_charging_title">Подсветка при зарядке</string>
++    <string name="bottom_led_charging_summary">Подсвечивать панель во время зарядки</string>
++    <string name="bottom_led_cat_brightness">Внешний вид</string>
++    <string name="bottom_led_brightness_title">Яркость панели</string>
++    <string name="bottom_led_brightness_summary">Регулировка яркости нижней подсветки</string>
+ </resources>
+diff --git a/res/values/arrays.xml b/res/values/arrays.xml
+index 392873e..203f372 100644
+--- a/res/values/arrays.xml
++++ b/res/values/arrays.xml
+@@ -803,4 +803,16 @@
+         <item>4</item>
+     </string-array>
+ 
++    <string-array name="entries_bottom_led_brightness" translatable="false">
++        <item>50% (Dim)</item>
++        <item>75%</item>
++        <item>100% (Default)</item>
++        <item>130% (Bright)</item>
++    </string-array>
++    <string-array name="values_bottom_led_brightness" translatable="false">
++        <item>50</item>
++        <item>75</item>
++        <item>100</item>
++        <item>130</item>
++    </string-array>
+ </resources>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index fcf51bb..fb6b420 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -821,4 +821,23 @@
+     <string name="perm_enable_management_summary">Enable application permissions management</string>
+     <string name="perm_enable_warning_message">Warning!\nRevoking most permissions will most likely cause applications to malfunction. If an application with revoked permissions force-closes please grant the expected permissions or don\'t use the application.\nPlease DO NOT send bug reports to Cyanogenmod if an application with revoked permissions is not working as expected!</string>
+     <string name="perm_enable_warning_title">Are you sure?</string>
++    <!-- Bottom LED Bar -->
++    <string name="bottom_led_title">Bottom LED bar</string>
++    <string name="bottom_led_summary">Lockscreen battery glow, music lighting and notifications</string>
++    <string name="bottom_led_enabled_title">Enable bottom LED bar</string>
++    <string name="bottom_led_enabled_summary">Master switch for the chin RGB strip</string>
++    <string name="bottom_led_cat_behavior">Behavior</string>
++    <string name="bottom_led_lockscreen_title">Lockscreen battery glow</string>
++    <string name="bottom_led_lockscreen_summary">Smoothly glow with battery color on the lockscreen</string>
++    <string name="bottom_led_music_title">Music track color</string>
++    <string name="bottom_led_music_summary">Light up using dominant album art colors during playback</string>
++    <string name="bottom_led_music_pulse_title">Pulse during playback</string>
++    <string name="bottom_led_music_pulse_summary">Hardware breathing pulse while music is playing</string>
++    <string name="bottom_led_notif_title">Notification accent</string>
++    <string name="bottom_led_notif_summary">Warm yellow-orange breathing glow for unread notifications</string>
++    <string name="bottom_led_charging_title">Charging indicator</string>
++    <string name="bottom_led_charging_summary">Keep bottom bar lit while charging (off recommended for sleep)</string>
++    <string name="bottom_led_cat_brightness">Appearance</string>
++    <string name="bottom_led_brightness_title">Brightness level</string>
++    <string name="bottom_led_brightness_summary">Adjust bottom LED bar intensity</string>
+ </resources>
+diff --git a/res/xml/bottom_led_settings.xml b/res/xml/bottom_led_settings.xml
+new file mode 100644
+index 0000000..832230d
+--- /dev/null
++++ b/res/xml/bottom_led_settings.xml
+@@ -0,0 +1,63 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android">
++
++    <CheckBoxPreference
++        android:key="pref_bottom_led_enabled"
++        android:title="@string/bottom_led_enabled_title"
++        android:summary="@string/bottom_led_enabled_summary"
++        android:defaultValue="true" />
++
++    <PreferenceCategory android:title="@string/bottom_led_cat_behavior">
++
++        <CheckBoxPreference
++            android:key="pref_bottom_led_lockscreen"
++            android:title="@string/bottom_led_lockscreen_title"
++            android:summary="@string/bottom_led_lockscreen_summary"
++            android:dependency="pref_bottom_led_enabled"
++            android:defaultValue="true" />
++
++        <CheckBoxPreference
++            android:key="pref_bottom_led_music"
++            android:title="@string/bottom_led_music_title"
++            android:summary="@string/bottom_led_music_summary"
++            android:dependency="pref_bottom_led_enabled"
++            android:defaultValue="true" />
++
++        <CheckBoxPreference
++            android:key="pref_bottom_led_music_pulse"
++            android:title="@string/bottom_led_music_pulse_title"
++            android:summary="@string/bottom_led_music_pulse_summary"
++            android:dependency="pref_bottom_led_music"
++            android:defaultValue="true" />
++
++        <CheckBoxPreference
++            android:key="pref_bottom_led_notif"
++            android:title="@string/bottom_led_notif_title"
++            android:summary="@string/bottom_led_notif_summary"
++            android:dependency="pref_bottom_led_enabled"
++            android:defaultValue="true" />
++
++        <CheckBoxPreference
++            android:key="pref_bottom_led_charging"
++            android:title="@string/bottom_led_charging_title"
++            android:summary="@string/bottom_led_charging_summary"
++            android:dependency="pref_bottom_led_enabled"
++            android:defaultValue="false" />
++
++    </PreferenceCategory>
++
++    <PreferenceCategory android:title="@string/bottom_led_cat_brightness">
++
++        <ListPreference
++            android:key="pref_bottom_led_brightness"
++            android:dialogTitle="@string/bottom_led_brightness_title"
++            android:title="@string/bottom_led_brightness_title"
++            android:summary="@string/bottom_led_brightness_summary"
++            android:dependency="pref_bottom_led_enabled"
++            android:entries="@array/entries_bottom_led_brightness"
++            android:entryValues="@array/values_bottom_led_brightness"
++            android:defaultValue="100" />
++
++    </PreferenceCategory>
++
++</PreferenceScreen>
+diff --git a/res/xml/ui_settings.xml b/res/xml/ui_settings.xml
+index 7f242a6..7118b13 100644
+--- a/res/xml/ui_settings.xml
++++ b/res/xml/ui_settings.xml
+@@ -32,6 +32,14 @@
+ 				android:targetClass="com.cyanogenmod.cmparts.activities.led.NotificationActivity" />
+ 		</PreferenceScreen>
+ 
++		<!-- Bottom LED bar -->
++		<PreferenceScreen android:key="bottom_led_settings"
++			android:title="@string/bottom_led_title" android:summary="@string/bottom_led_summary">
++			<intent android:action="android.intent.action.MAIN"
++				android:targetPackage="com.cyanogenmod.cmparts"
++				android:targetClass="com.cyanogenmod.cmparts.activities.BottomLedActivity" />
++		</PreferenceScreen>
++
+ 		<!-- Render effect -->
+ 		<ListPreference android:key="pref_render_effect"
+ 			android:dialogTitle="@string/pref_render_effect_title" android:title="@string/pref_render_effect_title"
+diff --git a/src/com/cyanogenmod/cmparts/activities/BottomLedActivity.java b/src/com/cyanogenmod/cmparts/activities/BottomLedActivity.java
+new file mode 100644
+index 0000000..3da7bd7
+--- /dev/null
++++ b/src/com/cyanogenmod/cmparts/activities/BottomLedActivity.java
+@@ -0,0 +1,134 @@
++/*
++ * Copyright (C) 2011 The CyanogenMod Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.cyanogenmod.cmparts.activities;
++
++import android.content.ContentResolver;
++import android.os.Bundle;
++import android.os.SystemProperties;
++import android.preference.CheckBoxPreference;
++import android.preference.ListPreference;
++import android.preference.Preference;
++import android.preference.Preference.OnPreferenceChangeListener;
++import android.preference.PreferenceActivity;
++import android.preference.PreferenceScreen;
++import android.provider.Settings;
++
++import com.cyanogenmod.cmparts.R;
++
++public class BottomLedActivity extends PreferenceActivity implements OnPreferenceChangeListener {
++
++    private static final String PREF_ENABLED = "pref_bottom_led_enabled";
++    private static final String PREF_LOCKSCREEN = "pref_bottom_led_lockscreen";
++    private static final String PREF_MUSIC = "pref_bottom_led_music";
++    private static final String PREF_MUSIC_PULSE = "pref_bottom_led_music_pulse";
++    private static final String PREF_NOTIF = "pref_bottom_led_notif";
++    private static final String PREF_CHARGING = "pref_bottom_led_charging";
++    private static final String PREF_BRIGHTNESS = "pref_bottom_led_brightness";
++
++    private CheckBoxPreference mEnabledPref;
++    private CheckBoxPreference mLockscreenPref;
++    private CheckBoxPreference mMusicPref;
++    private CheckBoxPreference mMusicPulsePref;
++    private CheckBoxPreference mNotifPref;
++    private CheckBoxPreference mChargingPref;
++    private ListPreference mBrightnessPref;
++
++    @Override
++    public void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++
++        setTitle(R.string.bottom_led_title);
++        addPreferencesFromResource(R.xml.bottom_led_settings);
++
++        PreferenceScreen prefSet = getPreferenceScreen();
++        ContentResolver cr = getContentResolver();
++
++        mEnabledPref = (CheckBoxPreference) prefSet.findPreference(PREF_ENABLED);
++        mLockscreenPref = (CheckBoxPreference) prefSet.findPreference(PREF_LOCKSCREEN);
++        mMusicPref = (CheckBoxPreference) prefSet.findPreference(PREF_MUSIC);
++        mMusicPulsePref = (CheckBoxPreference) prefSet.findPreference(PREF_MUSIC_PULSE);
++        mNotifPref = (CheckBoxPreference) prefSet.findPreference(PREF_NOTIF);
++        mChargingPref = (CheckBoxPreference) prefSet.findPreference(PREF_CHARGING);
++        mBrightnessPref = (ListPreference) prefSet.findPreference(PREF_BRIGHTNESS);
++
++        mEnabledPref.setChecked(Settings.System.getInt(cr, "bottom_led_enabled", 1) != 0);
++        mLockscreenPref.setChecked(Settings.System.getInt(cr, "bottom_led_lockscreen", 1) != 0);
++        mMusicPref.setChecked(Settings.System.getInt(cr, "bottom_led_music", 1) != 0);
++        mMusicPulsePref.setChecked(Settings.System.getInt(cr, "bottom_led_music_pulse", 1) != 0);
++        mNotifPref.setChecked(SystemProperties.getInt("persist.sys.bottom_led_notif", 1) != 0);
++        mChargingPref.setChecked(SystemProperties.getInt("persist.sys.bottom_led_charging", 0) != 0);
++
++        int bright = Settings.System.getInt(cr, "bottom_led_brightness", 100);
++        mBrightnessPref.setValue(String.valueOf(bright));
++        updateBrightnessSummary(String.valueOf(bright));
++        mBrightnessPref.setOnPreferenceChangeListener(this);
++    }
++
++    private void updateBrightnessSummary(String value) {
++        int idx = mBrightnessPref.findIndexOfValue(value);
++        if (idx >= 0) {
++            CharSequence[] entries = mBrightnessPref.getEntries();
++            if (entries != null && idx < entries.length) {
++                mBrightnessPref.setSummary(entries[idx]);
++                return;
++            }
++        }
++        mBrightnessPref.setSummary(R.string.bottom_led_brightness_summary);
++    }
++
++    public boolean onPreferenceChange(Preference preference, Object newValue) {
++        if (preference == mBrightnessPref) {
++            String val = String.valueOf(newValue);
++            int intVal = 100;
++            try {
++                intVal = Integer.parseInt(val);
++            } catch (NumberFormatException ignored) {}
++            Settings.System.putInt(getContentResolver(), "bottom_led_brightness", intVal);
++            SystemProperties.set("persist.sys.bottom_led_bright", val);
++            updateBrightnessSummary(val);
++            return true;
++        }
++        return false;
++    }
++
++    @Override
++    public boolean onPreferenceTreeClick(PreferenceScreen preferenceScreen, Preference preference) {
++        ContentResolver cr = getContentResolver();
++        if (preference == mEnabledPref) {
++            boolean checked = mEnabledPref.isChecked();
++            Settings.System.putInt(cr, "bottom_led_enabled", checked ? 1 : 0);
++            SystemProperties.set("persist.sys.bottom_led_enabled", checked ? "1" : "0");
++            return true;
++        } else if (preference == mLockscreenPref) {
++            Settings.System.putInt(cr, "bottom_led_lockscreen", mLockscreenPref.isChecked() ? 1 : 0);
++            return true;
++        } else if (preference == mMusicPref) {
++            Settings.System.putInt(cr, "bottom_led_music", mMusicPref.isChecked() ? 1 : 0);
++            return true;
++        } else if (preference == mMusicPulsePref) {
++            Settings.System.putInt(cr, "bottom_led_music_pulse", mMusicPulsePref.isChecked() ? 1 : 0);
++            return true;
++        } else if (preference == mNotifPref) {
++            SystemProperties.set("persist.sys.bottom_led_notif", mNotifPref.isChecked() ? "1" : "0");
++            return true;
++        } else if (preference == mChargingPref) {
++            SystemProperties.set("persist.sys.bottom_led_charging", mChargingPref.isChecked() ? "1" : "0");
++            return true;
++        }
++        return super.onPreferenceTreeClick(preferenceScreen, preference);
++    }
++}
 diff --git a/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java b/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java
 index f14939c..be78018 100644
 --- a/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java

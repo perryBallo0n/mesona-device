@@ -7,7 +7,7 @@ This guide documents how to build the Linux 3.4 kernel, pure AOSP 2.3.7 (`full_m
 ## 1. Host Prerequisites
 
 - **OS**: Ubuntu 20.04/22.04 or WSL2 Ubuntu (64-bit) with at least 8–16 GB RAM and ~40 GB free disk space.
-- **JDK**: Oracle/Sun Java SE 6 (`java-6-sun`, e.g. `/usr/lib/jvm/java-6-sun`) — Gingerbread requires JDK 6.
+- **JDK**: Oracle/Sun Java SE 6 or OpenJDK 8 configured with `-source 1.6 -target 1.6` compatibility (`build/core/main.mk`).
 - **Build tools**: `git`, `gnupg`, `flex`, `bison`, `gperf`, `build-essential`, `zip`, `curl`, `zlib1g-dev`, `gcc-multilib`, `g++-multilib`, `libc6-dev-i386`, `lib32ncurses5-dev`, `x11proto-core-dev`, `libx11-dev`, `lib32z1-dev`, `python2.7`, `ccache`.
 - **Cross-toolchain**: `arm-eabi-4.4.3` included in the ROM tree under `prebuilt/linux-x86/toolchain/arm-eabi-4.4.3/bin/`.
 
@@ -29,13 +29,14 @@ For **CyanogenMod 7**, start from a CyanogenMod 7 (`gingerbread`) source tree, c
 
 - `patches/external_libpng_35b24a4.patch` -> `external/libpng`
 - `patches/packages_apps_Gallery3D.patch` -> `packages/apps/Gallery3D`
+- `patches/packages_apps_Camera.patch` -> `packages/apps/Camera`
 - `patches/frameworks_base_fixes.patch` -> `frameworks/base`
 - `patches/hardware_msm7k_liblights.patch` -> `hardware/msm7k`
 - `patches/packages_apps_CMParts.patch` -> `packages/apps/CMParts`
 - `patches/bootable_recovery.patch` -> `bootable/recovery`
 - `patches/system_core.patch` -> `system/core`
 
-For **AOSP 2.3.7**, use the forked `mesona-frameworks-base` and `mesona-hardware-msm7k-v2` repos directly and apply `device/sony/mesona/patches/` (`external_libpng.patch`, `packages_apps_Gallery3D.patch`, `bootable_recovery.patch`, `system_core.patch`).
+For **AOSP 2.3.7**, use `mesona-frameworks-base` and `mesona-hardware-msm7k-v2` (`main`) and apply `device/sony/mesona/patches/` (`build_display_id.patch`, `external_libpng.patch`, `packages_apps_Gallery3D.patch`, `hardware_msm7k_liblights.patch`, `bootable_recovery.patch`, `system_core.patch`).
 
 ---
 
@@ -56,11 +57,12 @@ cp arch/arm/boot/zImage ../../device/sony/mesona/kernel
 ```
 
 Key defconfig & board settings enabled by default:
-- `CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND=y` (with `scaling_min_freq=122880` in `init.qcom.rc`)
+- `CONFIG_SWAP=y`, `CONFIG_ZSMALLOC=y`, `CONFIG_ZRAM=y` (ARM `zsmalloc` port, initialized as 128 MB `zram0` swap via `/system/etc/init_zram.sh`)
+- `CONFIG_CPU_FREQ_GOV_SMARTASS2=y` (`smartassV2` available) + `interactive` tuned on `sys.boot_completed=1` (`scaling_min_freq=122880`)
 - Production config (no heavy runtime `DEBUG_PAGEALLOC`/`DEBUG_SPINLOCK`/`DEBUG_MUTEXES`/`SLUB_DEBUG`/`PROFILING`)
-- `msm7x27a_pm_data` `RAMP_DOWN_AND_WAIT_FOR_INTERRUPT` enabled for short CPU idle gaps
-- Adreno 200 KGSL (`init_level=1` 192 MHz default, dynamic scale to 245.76 MHz at >=70% busy, `nap_allowed=true`, `idle_timeout=HZ/5`)
-- `bcmdhd` Wi-Fi (`-DDHD_USE_EARLYSUSPEND`, adaptive watchdog polling backoff up to `500 ms` in suspend)
+- `msm7x27a_pm_data` `RAMP_DOWN_AND_WAIT_FOR_INTERRUPT` enabled and `fih_msm_battery.c` AC wakelock switched to `wake_lock_timeout(5 * HZ)`
+- Adreno 200 KGSL power nap/idle scaling (`192 -> 245.76 MHz`)
+- `bcmdhd` Wi-Fi (`-DDHD_USE_EARLYSUSPEND`, adaptive watchdog backoff up to `500 ms` in suspend)
 - `LM3561` torch LED (`/sys/class/leds/flashlight/brightness`)
 
 ---
@@ -69,11 +71,9 @@ Key defconfig & board settings enabled by default:
 
 ```bash
 export USE_CCACHE=1
-export JAVA_HOME=/usr/lib/jvm/java-6-sun
-export PATH=/usr/lib/jvm/java-6-sun/bin:/usr/bin:/bin:/usr/local/bin:$PATH
 ```
 
-> Note: When switching `lunch` between clean (`*_mesona-eng`) and GApps (`*_mesona_gapps-eng`) targets, Android's build system triggers `installclean` automatically so packages do not mix across variants.
+> Note: When switching `lunch` between clean (`*_mesona-eng`) and GApps (`*_mesona_gapps-eng`) targets, Android's build system triggers `installclean` automatically so packages do not mix across variants. Remove `out/target/product/mesona/system/build.prop` before rebuilding to refresh the `YYYYMMDD` build ID.
 
 ---
 
@@ -127,7 +127,6 @@ Outputs in `out/target/product/mesona/`:
 ```bash
 fastboot flash boot boot.img
 fastboot flash system system.img
-fastboot erase cache
 fastboot erase userdata   # required when switching between AOSP and CM7
 fastboot reboot
 ```

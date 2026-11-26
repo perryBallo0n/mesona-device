@@ -1,0 +1,25 @@
+diff --git a/src/com/android/camera/Camera.java b/src/com/android/camera/Camera.java
+index af7da88..424658e 100644
+--- a/src/com/android/camera/Camera.java
++++ b/src/com/android/camera/Camera.java
+@@ -436,6 +436,7 @@ public class Camera extends BaseCamera implements View.OnClickListener,
+     private float[] getZoomRatios() {
+         if(!mParameters.isZoomSupported()) return null;
+         List<Integer> zoomRatios = mParameters.getZoomRatios();
++        if (zoomRatios == null || zoomRatios.isEmpty()) return null;
+         float result[] = new float[zoomRatios.size()];
+         for (int i = 0, n = result.length; i < n; ++i) {
+             result[i] = (float) zoomRatios.get(i) / 100f;
+diff --git a/src/com/android/camera/VideoCamera.java b/src/com/android/camera/VideoCamera.java
+index a3bb15c..1e8bdbe 100644
+--- a/src/com/android/camera/VideoCamera.java
++++ b/src/com/android/camera/VideoCamera.java
+@@ -1125,7 +1125,7 @@ public class VideoCamera extends BaseCamera
+             if (info.facing == CameraInfo.CAMERA_FACING_FRONT) {
+                 rotation = (info.orientation - mOrientation + mDeviceScreenRotation + 360) % 360;
+             } else {  // back-facing camera
+-                rotation = (info.orientation + mOrientation - mDeviceScreenRotation) % 360;
++                rotation = (info.orientation + mOrientation - mDeviceScreenRotation + 360) % 360;
+             }
+         }
+         mMediaRecorder.setOrientationHint(rotation);

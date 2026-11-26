@@ -88,19 +88,30 @@ index f7ec294..133f8a5 100644
              if (stmt != null) stmt.close();
          }
 diff --git a/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java b/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
-index 8e6706c..ee1007e 100644
+index 8e6706c..879fae7 100644
 --- a/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
 +++ b/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
-@@ -52,6 +52,8 @@ import android.view.KeyEvent;
+@@ -52,6 +52,19 @@ import android.view.KeyEvent;
  import android.view.WindowManagerImpl;
  import android.view.WindowManagerPolicy;
  import android.widget.TextView;
 +import java.io.FileWriter;
 +import java.io.IOException;
++import android.content.ContentUris;
++import android.database.ContentObserver;
++import android.database.Cursor;
++import android.graphics.Bitmap;
++import android.graphics.BitmapFactory;
++import android.graphics.Color;
++import android.os.Bundle;
++import android.os.HandlerThread;
++import android.provider.MediaStore;
++import java.io.File;
++import java.io.InputStream;
  
  
  /**
-@@ -290,6 +292,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -290,6 +303,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          mUpdateMonitor = new KeyguardUpdateMonitor(context);
  
          mUpdateMonitor.registerSimStateCallback(this);
@@ -108,7 +119,7 @@ index 8e6706c..ee1007e 100644
  
          mLockPatternUtils = new LockPatternUtils(mContext);
  
-@@ -308,6 +311,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -308,9 +322,25 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          IntentFilter iF = new IntentFilter();
          iF.addAction("com.android.music.metachanged");
          iF.addAction("com.android.music.playstatechanged");
@@ -116,7 +127,25 @@ index 8e6706c..ee1007e 100644
          mContext.registerReceiver(mMusicReceiver, iF);
  
          mShowLockIcon = (Settings.System.getInt(cr, "show_status_bar_lock", 0) == 1);
-@@ -1164,6 +1168,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
++        readBottomLedSettings();
++        final ContentObserver bottomLedObserver = new ContentObserver(mHandler) {
++            @Override
++            public void onChange(boolean selfChange) {
++                synchronized (KeyguardViewMediator.this) {
++                    readBottomLedSettings();
++                    updateBottomLedBar();
++                }
++            }
++        };
++        cr.registerContentObserver(Settings.System.getUriFor("bottom_led_enabled"), false, bottomLedObserver);
++        cr.registerContentObserver(Settings.System.getUriFor("bottom_led_lockscreen"), false, bottomLedObserver);
++        cr.registerContentObserver(Settings.System.getUriFor("bottom_led_music"), false, bottomLedObserver);
++        cr.registerContentObserver(Settings.System.getUriFor("bottom_led_music_pulse"), false, bottomLedObserver);
++        cr.registerContentObserver(Settings.System.getUriFor("bottom_led_brightness"), false, bottomLedObserver);
+     }
+ 
+     /**
+@@ -1164,6 +1194,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
              } catch (RemoteException e) {
              }
              mShowKeyguardWakeLock.release();
@@ -124,7 +153,7 @@ index 8e6706c..ee1007e 100644
          }
      }
  
-@@ -1189,6 +1194,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1189,6 +1220,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
              mShowing = false;
              adjustUserActivityLocked();
              adjustStatusBarLocked();
@@ -132,7 +161,7 @@ index 8e6706c..ee1007e 100644
          }
      }
  
-@@ -1296,6 +1302,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1296,6 +1328,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          synchronized (KeyguardViewMediator.this) {
              if (DEBUG) Log.d(TAG, "handleNotifyScreenOff");
              mKeyguardViewManager.onScreenTurnedOff();
@@ -140,7 +169,7 @@ index 8e6706c..ee1007e 100644
          }
      }
  
-@@ -1307,6 +1314,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1307,6 +1340,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          synchronized (KeyguardViewMediator.this) {
              if (DEBUG) Log.d(TAG, "handleNotifyScreenOn");
              mKeyguardViewManager.onScreenTurnedOn();
@@ -148,7 +177,7 @@ index 8e6706c..ee1007e 100644
          }
      }
      private BroadcastReceiver mMusicReceiver = new BroadcastReceiver() {
-@@ -1314,13 +1322,22 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1314,13 +1348,22 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
          @Override
          public void onReceive(Context context, Intent intent) {
              String action = intent.getAction();
@@ -165,12 +194,12 @@ index 8e6706c..ee1007e 100644
 +            } else {
 +                mArtist = intent.getStringExtra("artist");
 +                mTrack = intent.getStringExtra("track");
-+                mPlaying = intent.getBooleanExtra("playing", false);
++                mPlaying = intent.getBooleanExtra("playing", Boolean.TRUE.equals(mPlaying));
 +                if (!mPlaying) {
 +                    mLastMusicFalseMs = SystemClock.uptimeMillis();
 +                }
-+                mSongId = intent.getLongExtra("songid", 0);
-+                mAlbumId = intent.getLongExtra("albumid", 0);
++                mSongId = getLongExtraCompat(intent, "songid", "id", 0L);
++                mAlbumId = getLongExtraCompat(intent, "albumid", "albumId", 0L);
 +            }
 +            Intent ui = new Intent("internal.policy.impl.updateSongStatus");
 +            context.sendBroadcast(ui);
@@ -178,11 +207,12 @@ index 8e6706c..ee1007e 100644
          }
      };
      public static String NowPlaying() {
-@@ -1338,6 +1355,223 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+@@ -1338,6 +1381,591 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
      public static long AlbumId() {
          return mAlbumId;
      }
-+
+-}
+ 
 +    private static final int[][] MUSIC_PALETTE = {
 +        {   0, 110, 160 }, // Cyan
 +        {  30,  70, 190 }, // Electric Blue
@@ -222,6 +252,62 @@ index 8e6706c..ee1007e 100644
 +    private int mLastBatteryLevel = -1;
 +    private Runnable mLedFadeRunnable = null;
 +    private long mLastMusicFalseMs = 0L;
++
++    private boolean mBottomLedEnabled = true;
++    private boolean mBottomLedLockscreen = true;
++    private boolean mBottomLedMusic = true;
++    private boolean mBottomLedMusicPulse = true;
++    private int mBottomLedBrightness = 100;
++    private boolean mMusicPulsingActive = false;
++    private int mPulseLedR = 0;
++    private int mPulseLedG = 0;
++    private int mPulseLedB = 0;
++
++    private HandlerThread mArtThread = null;
++    private Handler mArtHandler = null;
++    private String mArtCacheKey = null;
++    private String mArtPendingKey = null;
++    private int[] mArtCacheRgb = null;
++    private boolean mArtHasResult = false;
++
++    private static long getLongExtraCompat(Intent intent, String key1, String key2, long defVal) {
++        if (intent == null) return defVal;
++        Bundle extras = intent.getExtras();
++        if (extras == null) return defVal;
++        Object val = extras.get(key1);
++        if (val == null && key2 != null) {
++            val = extras.get(key2);
++        }
++        if (val instanceof Number) {
++            return ((Number) val).longValue();
++        }
++        if (val instanceof String) {
++            try {
++                return Long.parseLong((String) val);
++            } catch (NumberFormatException ignored) {}
++        }
++        return defVal;
++    }
++
++    private void readBottomLedSettings() {
++        ContentResolver cr = mContext.getContentResolver();
++        mBottomLedEnabled = (Settings.System.getInt(cr, "bottom_led_enabled", 1) != 0);
++        mBottomLedLockscreen = (Settings.System.getInt(cr, "bottom_led_lockscreen", 1) != 0);
++        mBottomLedMusic = (Settings.System.getInt(cr, "bottom_led_music", 1) != 0);
++        mBottomLedMusicPulse = (Settings.System.getInt(cr, "bottom_led_music_pulse", 1) != 0);
++        int bright = Settings.System.getInt(cr, "bottom_led_brightness", 100);
++        if (bright < 25) bright = 25;
++        if (bright > 150) bright = 150;
++        mBottomLedBrightness = bright;
++    }
++
++    private int scaleLed(int c) {
++        if (c <= 0) return 0;
++        int v = (c * mBottomLedBrightness) / 100;
++        if (v < 1) v = 1;
++        if (v > 235) v = 235;
++        return v;
++    }
 +
 +    private final KeyguardUpdateMonitor.InfoCallback mBatteryLedCallback =
 +            new KeyguardUpdateMonitor.InfoCallback() {
@@ -287,13 +373,299 @@ index 8e6706c..ee1007e 100644
 +        writeFihLedCmd(sb.toString());
 +    }
 +
++    private void ensureArtHandlerLocked() {
++        if (mArtHandler == null) {
++            mArtThread = new HandlerThread("KeyguardLedArt");
++            mArtThread.start();
++            mArtHandler = new Handler(mArtThread.getLooper());
++        }
++    }
++
++    private static Bitmap decodeScaledFromUri(ContentResolver cr, Uri uri) {
++        InputStream is = null;
++        try {
++            BitmapFactory.Options bounds = new BitmapFactory.Options();
++            bounds.inJustDecodeBounds = true;
++            is = cr.openInputStream(uri);
++            if (is == null) return null;
++            BitmapFactory.decodeStream(is, null, bounds);
++            try { is.close(); } catch (IOException ignored) {}
++            is = null;
++
++            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
++            int sample = 1;
++            int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
++            while ((maxDim / sample) > 64) {
++                sample *= 2;
++            }
++            BitmapFactory.Options opts = new BitmapFactory.Options();
++            opts.inSampleSize = sample;
++            opts.inPreferredConfig = Bitmap.Config.RGB_565;
++            is = cr.openInputStream(uri);
++            if (is == null) return null;
++            return BitmapFactory.decodeStream(is, null, opts);
++        } catch (Exception e) {
++            return null;
++        } finally {
++            if (is != null) {
++                try { is.close(); } catch (IOException ignored) {}
++            }
++        }
++    }
++
++    private static Bitmap decodeScaledFromFile(String path) {
++        if (path == null || path.length() == 0) return null;
++        File f = new File(path);
++        if (!f.isFile()) return null;
++        try {
++            BitmapFactory.Options bounds = new BitmapFactory.Options();
++            bounds.inJustDecodeBounds = true;
++            BitmapFactory.decodeFile(path, bounds);
++            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
++            int sample = 1;
++            int maxDim = Math.max(bounds.outWidth, bounds.outHeight);
++            while ((maxDim / sample) > 64) {
++                sample *= 2;
++            }
++            BitmapFactory.Options opts = new BitmapFactory.Options();
++            opts.inSampleSize = sample;
++            opts.inPreferredConfig = Bitmap.Config.RGB_565;
++            return BitmapFactory.decodeFile(path, opts);
++        } catch (Exception e) {
++            return null;
++        }
++    }
++
++    private static int[] extractVibrantRgb(Bitmap bmp) {
++        if (bmp == null) return null;
++        int w = bmp.getWidth();
++        int h = bmp.getHeight();
++        if (w <= 0 || h <= 0) return null;
++
++        final int NUM_BINS = 24;
++        float[] binWeight = new float[NUM_BINS];
++        float[] binR = new float[NUM_BINS];
++        float[] binG = new float[NUM_BINS];
++        float[] binB = new float[NUM_BINS];
++        float[] hsv = new float[3];
++
++        double neutralWeight = 0.0;
++        double neutralR = 0.0;
++        double neutralG = 0.0;
++        double neutralB = 0.0;
++
++        int stepX = Math.max(1, w / 48);
++        int stepY = Math.max(1, h / 48);
++        for (int y = 0; y < h; y += stepY) {
++            for (int x = 0; x < w; x += stepX) {
++                int px = bmp.getPixel(x, y);
++                int r = Color.red(px);
++                int g = Color.green(px);
++                int b = Color.blue(px);
++                Color.colorToHSV(px, hsv);
++                float sat = hsv[1];
++                float val = hsv[2];
++                if (val < 0.12f) continue;
++
++                neutralWeight += val;
++                neutralR += r * val;
++                neutralG += g * val;
++                neutralB += b * val;
++
++                if (sat < 0.18f || val < 0.15f) continue;
++
++                int bin = ((int) (hsv[0] / 15.0f)) % NUM_BINS;
++                if (bin < 0) bin += NUM_BINS;
++                float weight = (0.35f + sat * sat) * (0.35f + val);
++                binWeight[bin] += weight;
++                binR[bin] += r * weight;
++                binG[bin] += g * weight;
++                binB[bin] += b * weight;
++            }
++        }
++
++        int bestBin = -1;
++        float bestW = 0f;
++        for (int i = 0; i < NUM_BINS; i++) {
++            if (binWeight[i] > bestW) {
++                bestW = binWeight[i];
++                bestBin = i;
++            }
++        }
++
++        int outR, outG, outB;
++        if (bestBin >= 0 && bestW > 0f) {
++            outR = Math.round(binR[bestBin] / bestW);
++            outG = Math.round(binG[bestBin] / bestW);
++            outB = Math.round(binB[bestBin] / bestW);
++        } else if (neutralWeight > 0.0) {
++            outR = (int) Math.round(neutralR / neutralWeight);
++            outG = (int) Math.round(neutralG / neutralWeight);
++            outB = (int) Math.round(neutralB / neutralWeight);
++            int spread = Math.max(outR, Math.max(outG, outB)) - Math.min(outR, Math.min(outG, outB));
++            if (spread < 18) {
++                return new int[] { 155, 170, 190 };
++            }
++        } else {
++            return null;
++        }
++
++        Color.RGBToHSV(outR, outG, outB, hsv);
++        if (hsv[1] > 0.12f) {
++            hsv[1] = Math.min(1.0f, Math.max(0.55f, hsv[1] * 1.25f));
++        }
++        hsv[2] = 1.0f;
++        int vivid = Color.HSVToColor(hsv);
++        int vr = Color.red(vivid);
++        int vg = Color.green(vivid);
++        int vb = Color.blue(vivid);
++        int maxC = Math.max(vr, Math.max(vg, vb));
++        if (maxC <= 0) return null;
++        final int TARGET_PEAK = 190;
++        return new int[] {
++            (vr * TARGET_PEAK) / maxC,
++            (vg * TARGET_PEAK) / maxC,
++            (vb * TARGET_PEAK) / maxC
++        };
++    }
++
++    private int[] loadAlbumArtColor(long songId, long albumId, String artist, String track) {
++        ContentResolver cr = mContext.getContentResolver();
++        long resolvedAlbumId = albumId;
++        if (resolvedAlbumId <= 0) {
++            Cursor c = null;
++            try {
++                String[] proj = { MediaStore.Audio.Media.ALBUM_ID };
++                if (songId > 0) {
++                    c = cr.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj,
++                            MediaStore.Audio.Media._ID + "=?",
++                            new String[] { String.valueOf(songId) }, null);
++                } else if (artist != null && artist.length() > 0 && track != null && track.length() > 0) {
++                    c = cr.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj,
++                            MediaStore.Audio.Media.ARTIST + "=? AND " + MediaStore.Audio.Media.TITLE + "=?",
++                            new String[] { artist, track }, null);
++                } else if (track != null && track.length() > 0) {
++                    c = cr.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj,
++                            MediaStore.Audio.Media.TITLE + "=?",
++                            new String[] { track }, null);
++                }
++                if (c != null && c.moveToFirst()) {
++                    resolvedAlbumId = c.getLong(0);
++                }
++            } catch (Exception ignored) {
++            } finally {
++                if (c != null) c.close();
++            }
++        }
++
++        if (resolvedAlbumId <= 0) {
++            return null;
++        }
+ 
++        Bitmap bmp = decodeScaledFromUri(cr,
++                ContentUris.withAppendedId(Uri.parse("content://media/external/audio/albumart"), resolvedAlbumId));
++        if (bmp == null) {
++            Cursor ac = null;
++            try {
++                ac = cr.query(MediaStore.Audio.Albums.EXTERNAL_CONTENT_URI,
++                        new String[] { MediaStore.Audio.Albums.ALBUM_ART },
++                        MediaStore.Audio.Albums._ID + "=?",
++                        new String[] { String.valueOf(resolvedAlbumId) }, null);
++                if (ac != null && ac.moveToFirst()) {
++                    bmp = decodeScaledFromFile(ac.getString(0));
++                }
++            } catch (Exception ignored) {
++            } finally {
++                if (ac != null) ac.close();
++            }
++        }
++
++        if (bmp == null) {
++            return null;
++        }
++        try {
++            return extractVibrantRgb(bmp);
++        } finally {
++            bmp.recycle();
++        }
++    }
++
++    private void requestAlbumArtColorAsync(final String artKey, final long songId,
++            final long albumId, final String artist, final String track) {
++        if (artKey.equals(mArtPendingKey)) {
++            return;
++        }
++        mArtPendingKey = artKey;
++        ensureArtHandlerLocked();
++        mArtHandler.post(new Runnable() {
++            public void run() {
++                final int[] rgb = loadAlbumArtColor(songId, albumId, artist, track);
++                synchronized (KeyguardViewMediator.this) {
++                    mArtCacheKey = artKey;
++                    mArtCacheRgb = rgb;
++                    mArtHasResult = true;
++                    if (artKey.equals(mArtPendingKey)) {
++                        mArtPendingKey = null;
++                    }
++                }
++                mHandler.post(new Runnable() {
++                    public void run() {
++                        updateBottomLedBar();
++                    }
++                });
++            }
++        });
++    }
++
++    private void startBottomRgbPulse(int r, int g, int b) {
++        if (mLedFadeRunnable != null) {
++            mHandler.removeCallbacks(mLedFadeRunnable);
++            mLedFadeRunnable = null;
++        }
++        if (mMusicPulsingActive && mPulseLedR == r && mPulseLedG == g && mPulseLedB == b) {
++            return;
++        }
++        StringBuilder sb = new StringBuilder(192);
++        sb.append("3 4 0\n3 5 0\n3 6 0\n");
++        sb.append("1 4 0\n1 5 0\n1 6 0\n");
++        int[] ch = { 4, 5, 6 };
++        int[] vals = { r, g, b };
++        for (int i = 0; i < 3; i++) {
++            if (vals[i] > 0) {
++                int id = ch[i];
++                sb.append("16 ").append(id).append(" 1 1 1\n");
++                sb.append("6 ").append(id).append(" 45\n");
++                sb.append("25 ").append(id).append(' ').append(vals[i]).append('\n');
++            }
++        }
++        for (int i = 0; i < 3; i++) {
++            if (vals[i] > 0) {
++                sb.append("3 ").append(ch[i]).append(" 1\n");
++            }
++        }
++        writeFihLedCmd(sb.toString());
++        mMusicPulsingActive = true;
++        mPulseLedR = r;
++        mPulseLedG = g;
++        mPulseLedB = b;
++        mCurLedR = r;
++        mCurLedG = g;
++        mCurLedB = b;
++        mTargetLedR = r;
++        mTargetLedG = g;
++        mTargetLedB = b;
++    }
++
 +    private void animateBottomRgb(final int targetR, final int targetG, final int targetB,
 +            final int totalSteps, final int stepMs, final boolean releaseBusyOnFinish) {
-+        if (mLedFadeRunnable != null &&
++        boolean forceClearPulse = mMusicPulsingActive;
++        mMusicPulsingActive = false;
++
++        if (!forceClearPulse && mLedFadeRunnable != null &&
 +                mTargetLedR == targetR && mTargetLedG == targetG && mTargetLedB == targetB) {
 +            return;
 +        }
-+        if (mLedFadeRunnable == null &&
++        if (!forceClearPulse && mLedFadeRunnable == null &&
 +                mCurLedR == targetR && mCurLedG == targetG && mCurLedB == targetB &&
 +                targetR == mTargetLedR && targetG == mTargetLedG && targetB == mTargetLedB) {
 +            if (releaseBusyOnFinish) {
@@ -374,34 +746,60 @@ index 8e6706c..ee1007e 100644
 +    }
 +
 +    private synchronized void updateBottomLedBar() {
-+        if (isMusicPlayingActive()) {
-+            SystemProperties.set("sys.fih_led.busy", "1");
-+            int idx = (int) (Math.abs(mSongId) % MUSIC_PALETTE.length);
-+            int[] c = MUSIC_PALETTE[idx];
-+            animateBottomRgb(c[0], c[1], c[2], 12, 25, false);
++        if (!mBottomLedEnabled) {
++            if (mMusicPulsingActive || mCurLedR != 0 || mCurLedG != 0 || mCurLedB != 0 || mLedFadeRunnable != null) {
++                SystemProperties.set("sys.fih_led.busy", "1");
++                animateBottomRgb(0, 0, 0, mScreenOn ? 10 : 6, 25, true);
++            } else {
++                SystemProperties.set("sys.fih_led.busy", "0");
++            }
 +            return;
 +        }
 +
-+        if (mShowing && mScreenOn) {
++        if (mBottomLedMusic && isMusicPlayingActive()) {
++            SystemProperties.set("sys.fih_led.busy", "1");
++            String artKey = mSongId + ":" + mAlbumId + ":"
++                    + (mArtist != null ? mArtist : "") + ":"
++                    + (mTrack != null ? mTrack : "");
++            int[] baseColor = null;
++            if (artKey.equals(mArtCacheKey) && mArtHasResult) {
++                baseColor = mArtCacheRgb;
++            } else {
++                requestAlbumArtColorAsync(artKey, mSongId, mAlbumId, mArtist, mTrack);
++            }
++            if (baseColor == null) {
++                int idx = (int) (Math.abs(mSongId) % MUSIC_PALETTE.length);
++                baseColor = MUSIC_PALETTE[idx];
++            }
++            int r = scaleLed(baseColor[0]);
++            int g = scaleLed(baseColor[1]);
++            int b = scaleLed(baseColor[2]);
++            if (mBottomLedMusicPulse) {
++                startBottomRgbPulse(r, g, b);
++            } else {
++                animateBottomRgb(r, g, b, 12, 25, false);
++            }
++            return;
++        }
++
++        if (mBottomLedLockscreen && mShowing && mScreenOn) {
 +            SystemProperties.set("sys.fih_led.busy", "1");
 +            int level = (mLastBatteryLevel >= 0) ? mLastBatteryLevel
 +                    : (mUpdateMonitor != null ? mUpdateMonitor.getBatteryLevel() : 100);
 +            int[] c = getBatteryBarColor(level);
-+            animateBottomRgb(c[0], c[1], c[2], 14, 25, false);
++            animateBottomRgb(scaleLed(c[0]), scaleLed(c[1]), scaleLed(c[2]), 14, 25, false);
 +            return;
 +        }
 +
 +        // Keep bottom bar off when unlocked or screen off (and never light it while charging).
-+        if (mCurLedR != 0 || mCurLedG != 0 || mCurLedB != 0 || mLedFadeRunnable != null) {
++        if (mMusicPulsingActive || mCurLedR != 0 || mCurLedG != 0 || mCurLedB != 0 || mLedFadeRunnable != null) {
 +            SystemProperties.set("sys.fih_led.busy", "1");
 +            animateBottomRgb(0, 0, 0, mScreenOn ? 12 : 8, 25, true);
 +        } else {
 +            SystemProperties.set("sys.fih_led.busy", "0");
 +        }
 +    }
- }
- 
- 
++}
 diff --git a/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp b/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp
 index 844cf18..619fd0b 100644
 --- a/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp
