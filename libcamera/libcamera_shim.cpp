@@ -286,6 +286,8 @@ static volatile bool g_preview_active = false;
 static volatile bool g_start_preview_in_progress = false;
 static int g_frame_index = 0;
 static uint32_t g_frame_seq = 0;
+static volatile bool g_sensor_inited = false;
+static volatile bool g_sensor_ready = false;
 
 /* Control/Config thread synchronization */
 struct gb_ctrl_cmd {
@@ -618,6 +620,7 @@ static int start_v4l2_streaming_locked(int fd, int w, int h) {
     init_real_libc();
     if (!g_orig_ioctl) return -1;
 
+    if (!g_sensor_ready) return -1;
     if (s_v4l2_fail_count >= 10) return -1;
 
     int req_w = 640;
@@ -1336,8 +1339,7 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                  fd, u[0], u[1], u[2]);
 
         if (u[0] == 0) { /* CFG_SET_MODE */
-            static bool s_sensor_inited = false;
-            if (!s_sensor_inited) {
+            if (!g_sensor_inited) {
                 uint8_t init_buf[512];
                 memset(init_buf, 0, sizeof(init_buf));
                 uint32_t *init_u = (uint32_t *)init_buf;
@@ -1350,7 +1352,7 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                 disk_log("ioctl SENSOR_IO_CFG CFG_SENSOR_INIT(29) on fd=%d -> rc=%d (errno=%d)",
                          fd, init_rc, errno);
                 if (init_rc == 0) {
-                    s_sensor_inited = true;
+                    g_sensor_inited = true;
                 }
             }
 
@@ -1367,6 +1369,9 @@ static int my_hooked_ioctl(int fd, int request, ...) {
         errno = 0;
         int rc = g_orig_ioctl ? g_orig_ioctl(fd, request, safe_buf) : 0;
         disk_log("ioctl SENSOR_IO_CFG (0x40046d15) REAL -> rc=%d (errno=%d)", rc, errno);
+        if (u[0] == 0 && rc == 0) {
+            g_sensor_ready = true;
+        }
         if (arg && rc == 0) {
             memcpy(arg, safe_buf, 64);
         }
@@ -1417,8 +1422,11 @@ static int my_hooked_ioctl(int fd, int request, ...) {
                     /* CAMERA_START_PREVIEW (37/39) / CAMERA_STOP_PREVIEW (38) are async in liboemcamera.so.
                      * Wait only briefly (up to 100ms) for config thread to dequeue via GET_STATS */
                     wait_ms = 100;
-                } else if (wait_ms > 5000) {
-                    wait_ms = 5000;
+                } else {
+                    uint32_t max_wait = g_sensor_ready ? 5000 : 10000;
+                    if (wait_ms > max_wait) {
+                        wait_ms = max_wait;
+                    }
                 }
                 ts.tv_sec += wait_ms / 1000;
                 ts.tv_nsec += (wait_ms % 1000) * 1000000L;
@@ -2777,6 +2785,50 @@ static const StrIntMap kMeterMap[] = {
     { "spot-metering", 2 },
 };
 
+static void release_camera_fds() {
+    pthread_mutex_lock(&g_kctrl_mutex);
+    g_config_fd = -1;
+    g_flash_init_fd = -1;
+    pthread_mutex_unlock(&g_kctrl_mutex);
+
+    pthread_mutex_lock(&g_v4l2_mutex);
+    if (g_v4l2_streaming) {
+        stop_v4l2_streaming_locked();
+    } else {
+        free_v4l2_cap_pool();
+    }
+    if (g_frame_fd >= 0) {
+        disk_log("release_camera_fds: closing g_frame_fd=%d", g_frame_fd);
+        close(g_frame_fd);
+        g_frame_fd = -1;
+    }
+    g_cam_frame_fd = -1;
+    g_preview_active = false;
+    g_start_preview_in_progress = false;
+    g_hal_preview_started = false;
+    g_pending_param_apply = false;
+    g_snapshot_in_progress = false;
+    g_shim_buffer_count = 0;
+    g_frame_index = 0;
+    g_cb_frame_count = 0;
+    g_enqueue_count = 0;
+    g_sensor_inited = false;
+    g_sensor_ready = false;
+    s_v4l2_fail_count = 0;
+    pthread_mutex_unlock(&g_v4l2_mutex);
+
+    pthread_mutex_lock(&g_ctrl_mutex);
+    g_has_pending_ctrl = false;
+    g_ctrl_cmd_done = false;
+    pthread_cond_broadcast(&g_ctrl_queue_cond);
+    pthread_cond_broadcast(&g_ctrl_done_cond);
+    pthread_mutex_unlock(&g_ctrl_mutex);
+
+    pthread_mutex_lock(&g_sensor_frame_mutex);
+    g_has_sensor_frame = false;
+    pthread_mutex_unlock(&g_sensor_frame_mutex);
+}
+
 namespace android {
 
 class QcomCameraAdapter : public CameraHardwareInterface {
@@ -3524,6 +3576,9 @@ public:
         disk_log("~QcomCameraAdapter ENTER: m_dev=%p", m_dev);
         g_hal_preview_started = false;
         g_preview_active = false;
+        if (g_frame_fd >= 0 && g_v4l2_streaming) {
+            stop_v4l2_streaming();
+        }
         if (g_active_adapter == this) {
             g_active_adapter = NULL;
         }
@@ -3534,6 +3589,7 @@ public:
             }
             m_dev = NULL;
         }
+        release_camera_fds();
         m_recording = false;
         pthread_mutex_lock(&m_rec_lock);
         for (int i = 0; i < MAX_REC_SLOTS; i++) {
@@ -4219,6 +4275,7 @@ public:
         m_af_cancel = true;
         m_af_gen++;
         pthread_mutex_unlock(&m_af_lock);
+        stop_v4l2_streaming();
         set_neg_ev_level(0);
         if (g_config_fd >= 0) {
             kernel_flash_ctrl(K_LED_MODE_OFF, K_LED_STATE_OFF);
@@ -4227,6 +4284,7 @@ public:
         if (m_dev && m_dev->ops && m_dev->ops->release) {
             m_dev->ops->release(m_dev);
         }
+        release_camera_fds();
     }
 
     virtual status_t dump(int fd, const Vector<String16>& args) const {
