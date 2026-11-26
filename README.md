@@ -6,15 +6,21 @@ Device tree for CyanogenMod 7 on Sony Xperia Miro (`ST23i` / `mesona`, Qualcomm 
 - **`main` branch**: Pure Android 2.3.7 (AOSP) — `full_mesona` and `full_mesona_gapps`.
 
 ## Key Fixes Included
+- **Battery / Thermal (`bcmdhd` + `cpufreq`)**: Added `-DDHD_USE_EARLYSUSPEND` (`pktfilter`/`roam_off`/`bcn_li_dtim` on screen off), adaptive idle/suspend watchdog polling backoff (`10 ms` active -> `100 ms` idle -> `250 ms` suspend), and `ondemand` default CPU governor (`122.88 MHz` min).
+- **UI & Animation FPS (`DisplayHardware` / `CMParts` / `system.prop`)**: Removed redundant post-swap `glFinish()`, disabled default software dithering (`persist.sys.use_dithering=0`, `CMParts`), and tuned pointer/event responsiveness.
+- **Flashlight / Torch (`flash.c` + `init.qcom.rc`)**: Registered LM3561 Torch `led_classdev` (`/sys/class/leds/flashlight/brightness`, `0666` permissions for CM7 `Torch` / Camera).
+- **Camera Portrait Orientation (`libcamera_shim.cpp`)**: Honored `CameraParameters::KEY_ROTATION` (`0`/`90`/`180`/`270`) during NV21->JPEG encoding so portrait photos are saved upright.
+- **Bottom LED Bar (`liblights` + `KeyguardViewMediator`)**: Enabled PMIC hardware PWM/fade bottom chin RGB LED (`fih_led` channels 4,5,6) on notifications, subtle charging indicator, lockscreen glow, unlock flash pulse, and track-colored music playback feedback.
 - **Kernel (`qcache`)**: Disabled cleancache (`qcache_cleancache_enabled = 0`) while keeping `fmem` for ION/Camera, fixing `/mnt/asec` corruption and Minecraft PE crashes.
 - **Adreno 200 (`adreno_config.txt`)**: `waitForIdleAfterDraw = 0`, `waitForIdleOnSubmit = 1`, `enableOptimizedVboUpdates = 1`, `useUncachedVBOs = 1`, `enableMemoryPool = 1` (fixes MCPE chunk dropout and Gallery3D HUD/blur).
 - **Gallery3D (`GridQuad.java`)**: Fixed fullscreen photo horizontal squishing (`recomputeQuad` `modifyOverlay = true` + `bindArrays` VBO upload order).
 - **CWM Recovery Exit**: Enabled `BOARD_HAS_NO_SELECT_BUTTON := true` (Power button selects menu items + Go Back entries) and bundled `/sbin/rmt_storage` via `recovery/init.rc` so reboot/power off completes modem EFS sync cleanly without hanging.
-- **Battery / BootAnimation / Wi-Fi**: `libpng` infinite loop fix (`35b24a4`), smooth `BootAnimation` pacing, tuned `ondemand` governor, and default `WIFI_SLEEP_POLICY_NEVER`.
 
 ## Platform Patches (`patches/`)
 - `external/libpng`: `patches/external_libpng_35b24a4.patch`
 - `packages/apps/Gallery3D`: `patches/packages_apps_Gallery3D.patch`
 - `frameworks/base`: `patches/frameworks_base_fixes.patch`
+- `hardware/msm7k`: `patches/hardware_msm7k_liblights.patch`
+- `packages/apps/CMParts`: `patches/packages_apps_CMParts.patch`
 - `bootable/recovery`: `patches/bootable_recovery.patch`
 - `system/core`: `patches/system_core.patch`

@@ -87,3 +87,214 @@ index f7ec294..133f8a5 100644
          } finally {
              if (stmt != null) stmt.close();
          }
+diff --git a/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java b/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
+index 8e6706c..2e87ce8 100644
+--- a/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
++++ b/policy/src/com/android/internal/policy/impl/KeyguardViewMediator.java
+@@ -52,6 +52,8 @@ import android.view.KeyEvent;
+ import android.view.WindowManagerImpl;
+ import android.view.WindowManagerPolicy;
+ import android.widget.TextView;
++import java.io.FileWriter;
++import java.io.IOException;
+ 
+ 
+ /**
+@@ -308,6 +310,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+         IntentFilter iF = new IntentFilter();
+         iF.addAction("com.android.music.metachanged");
+         iF.addAction("com.android.music.playstatechanged");
++        iF.addAction("com.android.music.playbackcomplete");
+         mContext.registerReceiver(mMusicReceiver, iF);
+ 
+         mShowLockIcon = (Settings.System.getInt(cr, "show_status_bar_lock", 0) == 1);
+@@ -1164,6 +1167,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+             } catch (RemoteException e) {
+             }
+             mShowKeyguardWakeLock.release();
++            updateBottomLedBar();
+         }
+     }
+ 
+@@ -1189,6 +1193,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+             mShowing = false;
+             adjustUserActivityLocked();
+             adjustStatusBarLocked();
++            triggerUnlockLedFlash();
+         }
+     }
+ 
+@@ -1296,6 +1301,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+         synchronized (KeyguardViewMediator.this) {
+             if (DEBUG) Log.d(TAG, "handleNotifyScreenOff");
+             mKeyguardViewManager.onScreenTurnedOff();
++            updateBottomLedBar();
+         }
+     }
+ 
+@@ -1307,6 +1313,7 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+         synchronized (KeyguardViewMediator.this) {
+             if (DEBUG) Log.d(TAG, "handleNotifyScreenOn");
+             mKeyguardViewManager.onScreenTurnedOn();
++            updateBottomLedBar();
+         }
+     }
+     private BroadcastReceiver mMusicReceiver = new BroadcastReceiver() {
+@@ -1314,13 +1321,22 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+         @Override
+         public void onReceive(Context context, Intent intent) {
+             String action = intent.getAction();
+-            mArtist = intent.getStringExtra("artist");
+-            mTrack = intent.getStringExtra("track");
+-            mPlaying = intent.getBooleanExtra("playing", false);
+-            mSongId = intent.getLongExtra("songid", 0);
+-            mAlbumId = intent.getLongExtra("albumid", 0);
+-            intent = new Intent("internal.policy.impl.updateSongStatus");
+-            context.sendBroadcast(intent);
++            if ("com.android.music.playbackcomplete".equals(action)) {
++                mPlaying = Boolean.FALSE;
++                mLastMusicFalseMs = SystemClock.uptimeMillis();
++            } else {
++                mArtist = intent.getStringExtra("artist");
++                mTrack = intent.getStringExtra("track");
++                mPlaying = intent.getBooleanExtra("playing", false);
++                if (!mPlaying) {
++                    mLastMusicFalseMs = SystemClock.uptimeMillis();
++                }
++                mSongId = intent.getLongExtra("songid", 0);
++                mAlbumId = intent.getLongExtra("albumid", 0);
++            }
++            Intent ui = new Intent("internal.policy.impl.updateSongStatus");
++            context.sendBroadcast(ui);
++            updateBottomLedBar();
+         }
+     };
+     public static String NowPlaying() {
+@@ -1338,6 +1354,112 @@ public class KeyguardViewMediator implements KeyguardViewCallback,
+     public static long AlbumId() {
+         return mAlbumId;
+     }
++
++    private static final int[][] MUSIC_PALETTE = {
++        {   0, 110, 160 }, // Cyan
++        {  30,  70, 190 }, // Electric Blue
++        { 130,  20, 160 }, // Violet
++        {  15, 145,  80 }, // Emerald
++        { 170,  75,  10 }, // Warm Amber
++        { 170,  30,  80 }, // Rose
++    };
++
++    private static void writeFihLedCmd(String cmd) {
++        FileWriter fw = null;
++        try {
++            fw = new FileWriter("/sys/class/led/fih_led/control");
++            fw.write(cmd);
++        } catch (IOException e) {
++        } finally {
++            if (fw != null) {
++                try { fw.close(); } catch (IOException ignored) {}
++            }
++        }
++    }
++
++    private static void setBottomRgb(int r, int g, int b, boolean breatheBlue) {
++        StringBuilder sb = new StringBuilder();
++        sb.append("3 4 0\n3 5 0\n3 6 0\n");
++        if (r > 0) {
++            sb.append("4 4 ").append(r).append("\n1 4 1\n");
++        } else {
++            sb.append("1 4 0\n");
++        }
++        if (g > 0) {
++            sb.append("4 5 ").append(g).append("\n1 5 1\n");
++        } else {
++            sb.append("1 5 0\n");
++        }
++        if (b > 0) {
++            if (breatheBlue) {
++                sb.append("1 6 0\n25 6 ").append(b).append("\n6 6 3\n3 6 1\n");
++            } else {
++                sb.append("4 6 ").append(b).append("\n1 6 1\n");
++            }
++        } else {
++            sb.append("1 6 0\n");
++        }
++        writeFihLedCmd(sb.toString());
++    }
++
++    private long mLastMusicFalseMs = 0L;
++
++    private boolean isMusicPlayingActive() {
++        if (Boolean.TRUE.equals(mPlaying)) return true;
++        if (Boolean.FALSE.equals(mPlaying) && (SystemClock.uptimeMillis() - mLastMusicFalseMs) < 1000L) {
++            return false;
++        }
++        try {
++            AudioManager am = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
++            return am != null && am.isMusicActive();
++        } catch (Exception e) {
++            return false;
++        }
++    }
++
++    private void triggerUnlockLedFlash() {
++        if (isMusicPlayingActive()) {
++            updateBottomLedBar();
++            return;
++        }
++        SystemProperties.set("sys.fih_led.busy", "1");
++        setBottomRgb(0, 90, 150, false);
++        mHandler.postDelayed(new Runnable() {
++            public void run() {
++                updateBottomLedBar();
++            }
++        }, 120);
++    }
++
++    private synchronized void updateBottomLedBar() {
++        boolean musicPlaying = isMusicPlayingActive();
++        if (musicPlaying) {
++            SystemProperties.set("sys.fih_led.busy", "1");
++            int idx = (int) (Math.abs(mSongId) % MUSIC_PALETTE.length);
++            int[] c = MUSIC_PALETTE[idx];
++            setBottomRgb(c[0], c[1], c[2], c[2] >= 100 && c[0] < 80);
++            return;
++        }
++
++        if (mShowing && mScreenOn) {
++            // Soft cyan-blue lockscreen accent
++            SystemProperties.set("sys.fih_led.busy", "1");
++            setBottomRgb(0, 45, 135, true);
++            return;
++        }
++
++        SystemProperties.set("sys.fih_led.busy", "0");
++        if (!mScreenOn && mUpdateMonitor != null && mUpdateMonitor.isDevicePluggedIn()) {
++            // Preserve subtle dim charging accent when screen turns off
++            if (mUpdateMonitor.isDeviceCharged()) {
++                setBottomRgb(0, 35, 0, false);
++            } else {
++                setBottomRgb(40, 14, 0, false);
++            }
++        } else {
++            setBottomRgb(0, 0, 0, false);
++        }
++    }
+ }
+ 
+ 
+diff --git a/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp b/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp
+index 844cf18..619fd0b 100644
+--- a/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp
++++ b/services/surfaceflinger/DisplayHardware/DisplayHardware.cpp
+@@ -332,9 +332,7 @@ void DisplayHardware::flip(const Region& dirty) const
+     
+     mPageFlipCount++;
+     eglSwapBuffers(dpy, surface);
+-    // glFinish here prevents the impedence mismatch between software-rendered
+-    // surfaceflinger surfaces in another thread. Shows no perf loss with vsync on.
+-    glFinish();
++    // compositionComplete() already flushed before flip(); avoid double-stalling the GPU/MDP pipeline.
+     checkEGLErrors("eglSwapBuffers");
+ 
+     // for debugging

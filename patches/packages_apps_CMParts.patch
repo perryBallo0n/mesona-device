@@ -1,0 +1,13 @@
+diff --git a/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java b/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java
+index f14939c..be78018 100644
+--- a/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java
++++ b/src/com/cyanogenmod/cmparts/activities/PerformanceSettingsActivity.java
+@@ -67,7 +67,7 @@ public class PerformanceSettingsActivity extends PreferenceActivity implements P
+ 
+     private static final String USE_DITHERING_PERSIST_PROP = "persist.sys.use_dithering";
+     
+-    private static final String USE_DITHERING_DEFAULT = "1";
++    private static final String USE_DITHERING_DEFAULT = "0";
+ 
+     private static final String USE_16BPP_ALPHA_PREF = "pref_use_16bpp_alpha";
+ 
